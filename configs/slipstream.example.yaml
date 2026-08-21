@@ -1,0 +1,76 @@
+# Slipstream — one pipeline per file, one file per process.
+#
+# Run this same file on two or more hosts pointing at the same control plane:
+# whichever instance holds the lease attaches to the source, the others stand
+# by. ${ENV} references are expanded at load time, so secrets stay out of the
+# file.
+
+# Defaults to <hostname>-<pid>; set it explicitly if your hostnames are not
+# stable (containers with generated names are fine as-is).
+instance_id: ${SLIPSTREAM_INSTANCE_ID}
+
+control_plane:
+  # A small Postgres of its own — not one of the source databases.
+  dsn: ${SLIPSTREAM_CONTROL_PLANE_DSN}
+  # Failover takes at most lease_ttl. Renewal must be comfortably shorter so a
+  # brief control-plane hiccup does not hand the pipeline over needlessly.
+  lease_ttl: 10s
+  lease_renew: 3s
+  # Applies the (idempotent) control-plane schema on startup.
+  auto_migrate: true
+
+pipeline:
+  id: pg-main
+  # How often the slowest sink's position is promoted to the pipeline offset
+  # and acknowledged back to the source.
+  commit_interval: 1s
+
+  source:
+    type: postgres          # postgres | mysql | mongodb
+    # Stamped on every event as source_id and part of the sink dedupe key.
+    # Changing it re-delivers everything.
+    id: pg-main
+    postgres:
+      # Needs the replication privilege and wal_level = logical.
+      dsn: ${SLIPSTREAM_SOURCE_DSN}
+      # Created on first run and reused forever after; this is what makes
+      # resume possible. Drop it by hand if you retire the pipeline, or it
+      # will pin WAL indefinitely.
+      slot: slipstream_pg_main
+      publication: slipstream_pg_main
+      tables:
+        - public.customers
+        - public.orders
+      # Take a consistent initial snapshot when there is no stored offset.
+      snapshot: true
+
+  sinks:
+    # Sinks progress independently: a slow one never blocks a fast one beyond
+    # its own queue, and the pipeline offset follows the slowest.
+    - name: mirror
+      type: pgupsert
+      queue_size: 8192
+      batch_max_events: 500
+      batch_max_wait: 200ms
+      pgupsert:
+        dsn: ${SLIPSTREAM_MIRROR_DSN}
+        # Key columns per table. Without them the sink refuses to write,
+        # because an upsert with no key duplicates rows on every replay.
+        keys:
+          public.customers: [id]
+          public.orders: [id]
+        # Keep deleted rows and stamp them instead of removing them.
+        soft_delete: false
+
+    - name: hook
+      type: webhook
+      batch_max_events: 200
+      webhook:
+        url: ${SLIPSTREAM_WEBHOOK_URL}
+        timeout: 30s
+        headers:
+          Authorization: Bearer ${SLIPSTREAM_WEBHOOK_TOKEN}
+
+    # Handy while bringing a pipeline up; JSON lines on stdout.
+    # - name: debug
+    #   type: stdout

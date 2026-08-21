@@ -1,0 +1,5 @@
+/bin/
+/dist/
+*.test
+slipstream.yaml
+.env

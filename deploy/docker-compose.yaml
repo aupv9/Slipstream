@@ -1,0 +1,64 @@
+# Local development stack: a source Postgres with logical WAL, a separate
+# control-plane Postgres, and two Slipstream instances so failover can be
+# exercised by stopping one of them.
+#
+#   docker compose -f deploy/docker-compose.yaml up --build
+#   docker compose -f deploy/docker-compose.yaml stop slipstream-a   # watch B take over
+
+services:
+  source-db:
+    image: postgres:16
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+    environment:
+      POSTGRES_PASSWORD: slip
+      POSTGRES_DB: app
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      retries: 30
+
+  control-plane-db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: slip
+      POSTGRES_DB: slipstream
+    ports: ["55433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      retries: 30
+
+  slipstream-a: &instance
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      source-db: {condition: service_healthy}
+      control-plane-db: {condition: service_healthy}
+    environment:
+      SLIPSTREAM_INSTANCE_ID: inst-a
+      SLIPSTREAM_CONTROL_PLANE_DSN: postgres://postgres:slip@control-plane-db:5432/slipstream
+      SLIPSTREAM_SOURCE_DSN: postgres://postgres:slip@source-db:5432/app
+      SLIPSTREAM_MIRROR_DSN: postgres://postgres:slip@source-db:5432/app
+      SLIPSTREAM_WEBHOOK_URL: http://example.invalid/hook
+      SLIPSTREAM_WEBHOOK_TOKEN: dev
+    volumes:
+      - ../configs/slipstream.example.yaml:/etc/slipstream/slipstream.yaml:ro
+
+  slipstream-b:
+    <<: *instance
+    environment:
+      SLIPSTREAM_INSTANCE_ID: inst-b
+      SLIPSTREAM_CONTROL_PLANE_DSN: postgres://postgres:slip@control-plane-db:5432/slipstream
+      SLIPSTREAM_SOURCE_DSN: postgres://postgres:slip@source-db:5432/app
+      SLIPSTREAM_MIRROR_DSN: postgres://postgres:slip@source-db:5432/app
+      SLIPSTREAM_WEBHOOK_URL: http://example.invalid/hook
+      SLIPSTREAM_WEBHOOK_TOKEN: dev

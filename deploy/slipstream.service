@@ -1,0 +1,31 @@
+# systemd unit for one pipeline instance. Install the same unit on two or more
+# hosts with the same config and control plane; the lease decides which one
+# reads the source.
+#
+#   /etc/slipstream/slipstream.yaml   pipeline config
+#   /etc/slipstream/env               DSNs and secrets, referenced as ${VAR}
+
+[Unit]
+Description=Slipstream CDC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=slipstream
+Group=slipstream
+EnvironmentFile=/etc/slipstream/env
+ExecStart=/usr/local/bin/slipstream run -config /etc/slipstream/slipstream.yaml -log-format json
+Restart=always
+RestartSec=2
+# Give the process time to release its lease so the standby takes over
+# immediately instead of waiting out the TTL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
