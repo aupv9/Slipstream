@@ -98,7 +98,7 @@ func (r *Reader) ReadChanges(ctx context.Context, req source.ReadRequest, out ch
 	}
 	defer admin.Close(context.Background())
 
-	if err := r.ensurePublication(ctx, admin); err != nil {
+	if err := r.reconcilePublication(ctx, admin); err != nil {
 		return err
 	}
 
@@ -471,6 +471,20 @@ func (r *Reader) handle(ctx context.Context, msg pglogrepl.Message, xld pglogrep
 		}
 		return emit(ctx, out, r.event(rel, cdc.OpDelete, r.decodeTuple(rel, m.OldTuple), nil, xld, *txCommitTS))
 
+	case *pglogrepl.TruncateMessage:
+		// One TRUNCATE can name several relations. Dropping this message would
+		// leave sinks holding every row the source just discarded.
+		for _, id := range m.RelationIDs {
+			rel, ok := r.rels[id]
+			if !ok {
+				return fmt.Errorf("postgres: truncate for unknown relation %d", id)
+			}
+			if err := emit(ctx, out, r.event(rel, cdc.OpTruncate, nil, nil, xld, *txCommitTS)); err != nil {
+				return err
+			}
+		}
+		return nil
+
 	default:
 		return nil
 	}
@@ -536,18 +550,85 @@ func (r *Reader) sendStandbyUpdate(ctx context.Context) error {
 	return nil
 }
 
-// ensurePublication creates the publication on first run if it is missing.
-func (r *Reader) ensurePublication(ctx context.Context, admin *pgx.Conn) error {
+// reconcilePublication creates the publication on first run, and on later runs
+// checks it still covers the configured tables.
+//
+// The dangerous case is a table added to the config after the publication
+// exists: the old code saw the publication and returned, so pgoutput never
+// decoded that table and nothing said so. Silence there means an operator
+// believes a table is replicating when it is not.
+func (r *Reader) reconcilePublication(ctx context.Context, admin *pgx.Conn) error {
 	var exists bool
 	if err := admin.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)`,
 		r.cfg.Publication).Scan(&exists); err != nil {
 		return fmt.Errorf("postgres: check publication: %w", err)
 	}
-	if exists {
+	if !exists {
+		return r.createPublication(ctx, admin)
+	}
+	if len(r.cfg.Tables) == 0 {
+		// Nothing declared: the publication's own membership is the source of
+		// truth (FOR ALL TABLES, or managed by hand).
 		return nil
 	}
 
+	published, err := r.capturedTables(ctx, admin)
+	if err != nil {
+		return err
+	}
+	have := make(map[string]bool, len(published))
+	for _, t := range published {
+		have[t.String()] = true
+	}
+
+	var missing []table
+	for _, name := range r.cfg.Tables {
+		t, err := parseTable(name)
+		if err != nil {
+			return err
+		}
+		if !have[t.String()] {
+			missing = append(missing, t)
+		}
+		delete(have, t.String())
+	}
+	for extra := range have {
+		r.log.Warn("publication captures a table that is not in the config; leaving it alone",
+			"publication", r.cfg.Publication, "table", extra)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, len(missing))
+	quoted := make([]string, 0, len(missing))
+	for _, t := range missing {
+		names = append(names, t.String())
+		quoted = append(quoted, t.quoted())
+	}
+
+	if !r.cfg.AutoAddTables {
+		return fmt.Errorf("postgres: publication %s does not capture %v. "+
+			"Adding a table to an existing publication cannot be snapshotted consistently, "+
+			"so this is not done silently. Either give the table its own pipeline (it gets a "+
+			"proper snapshot), or re-bootstrap this one by dropping slot %s and its offsets row, "+
+			"or set auto_add_tables: true to capture it streaming-only, accepting that rows "+
+			"written before now are never delivered",
+			r.cfg.Publication, names, r.cfg.Slot)
+	}
+
+	if _, err := admin.Exec(ctx, fmt.Sprintf("ALTER PUBLICATION %s ADD TABLE %s",
+		quoteIdent(r.cfg.Publication), strings.Join(quoted, ", "))); err != nil {
+		return fmt.Errorf("postgres: add tables %v to publication %s: %w", names, r.cfg.Publication, err)
+	}
+	r.log.Warn("added tables to the publication without a snapshot; "+
+		"rows written before now will not be delivered for them",
+		"publication", r.cfg.Publication, "tables", names)
+	return nil
+}
+
+func (r *Reader) createPublication(ctx context.Context, admin *pgx.Conn) error {
 	stmt := fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES", quoteIdent(r.cfg.Publication))
 	if len(r.cfg.Tables) > 0 {
 		quoted := make([]string, 0, len(r.cfg.Tables))

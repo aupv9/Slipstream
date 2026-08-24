@@ -23,7 +23,9 @@ Instead the guarantees are a handful of invariants that can each be tested:
 | **Per-row order preserved** | One active reader, events emitted in source-log order, no parallelism inside a pipeline. |
 | **Snapshot and stream do not overlap or gap** | The initial snapshot runs inside the exact MVCC snapshot exported by the replication slot, so every row is either snapshotted or streamed — never both, never neither. |
 | **Replays cannot corrupt** | Every event carries a `position`; sinks either upsert on the primary key or dedupe on `(source_id, table, position)`. |
-| **Nothing is dropped** | Failed writes retry with capped backoff, forever. A broken sink stalls loudly instead of losing data quietly. |
+| **Nothing is dropped** | Failed writes retry with capped backoff, forever by default. A sink may opt into dead-lettering, which parks what it cannot deliver in the control plane rather than discarding it. |
+| **TRUNCATE is not silently lost** | A truncate is delivered as its own event; sinks clear the target instead of keeping rows the source no longer has. |
+| **A table cannot be half-configured** | A table listed in the config but missing from the publication stops the pipeline, instead of looking replicated while never being captured. |
 | **A stale leader cannot rewind progress** | Offset and cursor writes are fenced on still holding the lease; a zombie leader gets `ErrLeaseLost` and stops. |
 | **An interrupted snapshot is never mistaken for a complete one** | `snapshot_state` records the snapshot phase; an offset written mid-snapshot is discarded and the snapshot is taken again. |
 | **The source only releases logs we truly have** | The position acknowledged back to the source is the *slowest* sink's, never the read-ahead position. |
@@ -131,6 +133,16 @@ offset, which is the slowest sink's committed position — so the last few event
 before the crash are delivered again. That is the at-least-once window, and it
 is exactly why sinks must be idempotent.
 
+**Poison events.** By default a rejected batch is retried forever: nothing is
+lost, but one event a sink will never accept (a column the target lacks, a row
+it considers invalid) stalls that sink until someone intervenes — loudly, in the
+logs. A sink can instead be given `on_failure: dead_letter` with
+`max_attempts`, and then failures are isolated per event: the batch is retried
+one event at a time, only the ones that still fail are written to
+`dead_letters`, and the rest of the stream keeps moving. If that write fails
+too, the run stops rather than advancing — losing the delivery and the record of
+it at once would be silent data loss.
+
 **Unchanged TOASTed values.** Postgres omits large unchanged column values from
 the WAL record. Slipstream omits those keys from the event rather than sending
 `null`, and the upsert sink updates only the columns present, so a wide row is
@@ -148,6 +160,12 @@ never blanked by an update that did not touch it.
   if they are missing.
 - **`pgupsert` requires configured keys** per table. Without them it refuses to
   write, because a keyless upsert duplicates rows on every replay.
+- **Adding a table to a running pipeline** is refused by default: it cannot be
+  snapshotted consistently against a slot that already exists. Give the table
+  its own pipeline, re-bootstrap this one, or set `auto_add_tables: true` to
+  accept streaming-only capture for it.
+- **Check `dead_letters`** if a sink uses `on_failure: dead_letter`. Rows there
+  are events that were deliberately not delivered.
 - **Renaming `pipeline.id` or `source.id`** starts a new slot and a new dedupe
   key space: everything is re-delivered.
 - **A pipeline that logs `bootstrapping from scratch`** is re-reading the whole
@@ -164,6 +182,9 @@ never blanked by an update that did not touch it.
 | Snapshot crash safety (`snapshot_state`, forced re-bootstrap) | done, regression-tested |
 | Sink router: independent queues, cursors, retry, slowest-sink offset | done, unit-tested |
 | Sinks: webhook, pgupsert, stdout | done |
+| TRUNCATE propagation | done, integration-tested |
+| Publication reconcile (refuse silent table drift) | done, integration-tested |
+| Dead-letter queue with per-event isolation | done, unit-tested |
 | MySQL reader (binlog + GTID) | interface in place, reader pending |
 | MongoDB reader (change stream) | interface in place, reader pending |
 

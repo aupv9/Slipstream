@@ -41,6 +41,11 @@ pipeline:
       tables:
         - public.customers
         - public.orders
+      # Adding a table here after the publication exists cannot be snapshotted
+      # consistently, so by default the pipeline refuses to start and tells you
+      # the options. Set this to capture the new table streaming-only, knowing
+      # rows written before now are never delivered.
+      auto_add_tables: false
       # Take a consistent initial snapshot when there is no stored offset.
       snapshot: true
 
@@ -52,6 +57,11 @@ pipeline:
       queue_size: 8192
       batch_max_events: 500
       batch_max_wait: 200ms
+      # retry (default) never drops anything but lets one permanently rejected
+      # event stall this sink. dead_letter gives up after max_attempts and parks
+      # the offending events in the control plane's dead_letters table, so the
+      # rest of the stream keeps flowing.
+      on_failure: retry
       pgupsert:
         dsn: ${SLIPSTREAM_MIRROR_DSN}
         # Key columns per table. Without them the sink refuses to write,
@@ -65,6 +75,8 @@ pipeline:
     - name: hook
       type: webhook
       batch_max_events: 200
+      on_failure: dead_letter
+      max_attempts: 10
       webhook:
         url: ${SLIPSTREAM_WEBHOOK_URL}
         timeout: 30s

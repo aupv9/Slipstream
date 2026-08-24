@@ -20,6 +20,10 @@ const (
 	OpDelete Op = "d"
 	// OpRead is a row produced by the initial snapshot, not by the log.
 	OpRead Op = "r"
+	// OpTruncate is a TRUNCATE of the whole relation. It carries no row
+	// images: every row is gone. A sink that ignores it keeps rows the source
+	// no longer has.
+	OpTruncate Op = "t"
 )
 
 // ChangeEvent is one normalized row-level change.

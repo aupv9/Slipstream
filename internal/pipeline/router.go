@@ -3,6 +3,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"sync"
@@ -23,6 +24,7 @@ import (
 type progressStore interface {
 	SaveOffset(ctx context.Context, pipelineID, holder, position string, commitTS time.Time) error
 	AdvanceSinkCursor(ctx context.Context, pipelineID, holder, sinkName, position string, seq int64) error
+	DeadLetter(ctx context.Context, pipelineID, holder, sinkName, position string, attempts int, cause string, payload []byte) error
 }
 
 // Router fans one ordered event stream out to every configured sink.
@@ -59,9 +61,24 @@ func NewRouter(pipelineID, holder string, store progressStore, cfgs []config.Sin
 		positions:  make(map[int64]string),
 	}
 	for i, s := range sinks {
-		r.workers = append(r.workers, newWorker(cfgs[i], s, log))
+		r.workers = append(r.workers, newWorker(cfgs[i], s, r.park(s.Name()), log))
 	}
 	return r
+}
+
+// park writes one event to the dead-letter table. A failure here must not let
+// the pipeline advance, so the error propagates and the run restarts.
+func (r *Router) park(sinkName string) parkFunc {
+	return func(ctx context.Context, ev cdc.ChangeEvent, attempts int, cause error) error {
+		payload, err := json.Marshal(ev)
+		if err != nil {
+			// Keep the record even if the event will not marshal; losing the
+			// evidence is worse than losing its shape.
+			payload = []byte(`{"error":"event could not be marshalled"}`)
+		}
+		return r.store.DeadLetter(ctx, r.pipelineID, r.holder, sinkName,
+			ev.Position, attempts, cause.Error(), payload)
+	}
 }
 
 type seqEvent struct {
@@ -234,11 +251,15 @@ func (r *Router) prune(upTo int64) {
 	r.mu.Unlock()
 }
 
+// parkFunc records an event a sink would not accept.
+type parkFunc func(ctx context.Context, ev cdc.ChangeEvent, attempts int, cause error) error
+
 // worker drives one sink.
 type worker struct {
 	cfg   config.SinkConfig
 	sink  sink.Sink
 	queue chan seqEvent
+	park  parkFunc
 	log   *slog.Logger
 
 	mu           sync.Mutex
@@ -247,11 +268,12 @@ type worker struct {
 	persistedSeq int64
 }
 
-func newWorker(cfg config.SinkConfig, s sink.Sink, log *slog.Logger) *worker {
+func newWorker(cfg config.SinkConfig, s sink.Sink, park parkFunc, log *slog.Logger) *worker {
 	return &worker{
 		cfg:   cfg,
 		sink:  s,
 		queue: make(chan seqEvent, cfg.QueueSize),
+		park:  park,
 		log:   log.With("sink", s.Name()),
 	}
 }
@@ -327,16 +349,20 @@ func (w *worker) run(ctx context.Context) error {
 	}
 }
 
-// flush writes a batch, retrying with capped exponential backoff. It never
-// gives up: dropping a batch would break the at-least-once guarantee, so a
-// permanently broken sink stalls its own pipeline loudly instead of losing
-// data silently.
+// flush writes a batch, retrying with capped exponential backoff.
+//
+// With the default policy it never gives up: dropping a batch would break the
+// at-least-once guarantee, so a permanently broken sink stalls its own pipeline
+// loudly rather than losing data silently. A sink configured for dead-lettering
+// instead parks what it cannot deliver, so one poison event does not hold up
+// everything behind it.
 func (w *worker) flush(ctx context.Context, batch []cdc.ChangeEvent, lastSeq int64) error {
 	if len(batch) == 0 {
 		return nil
 	}
 	lastPos := batch[len(batch)-1].Position
 	delay := w.cfg.RetryInitial.D()
+	deadLetter := w.cfg.OnFailure == config.OnFailureDeadLetter && w.cfg.MaxAttempts > 0
 
 	for attempt := 1; ; attempt++ {
 		err := w.sink.Write(ctx, batch)
@@ -350,6 +376,15 @@ func (w *worker) flush(ctx context.Context, batch []cdc.ChangeEvent, lastSeq int
 			// replayed after resume.
 			return nil
 		}
+
+		if deadLetter && attempt >= w.cfg.MaxAttempts {
+			if perr := w.quarantine(ctx, batch, attempt, err); perr != nil {
+				return perr
+			}
+			w.setProgress(lastSeq, lastPos)
+			return nil
+		}
+
 		w.log.Error("sink write failed; retrying", "attempt", attempt, "events", len(batch), "backoff", delay, "err", err)
 
 		select {
@@ -361,6 +396,41 @@ func (w *worker) flush(ctx context.Context, batch []cdc.ChangeEvent, lastSeq int
 			delay = w.cfg.RetryMax.D()
 		}
 	}
+}
+
+// quarantine finds which events the sink actually refuses and parks only those.
+//
+// A batch usually fails because of one bad event; parking the whole batch would
+// throw away the good ones with it. So each event is retried on its own and only
+// the ones that still fail are dead-lettered.
+func (w *worker) quarantine(ctx context.Context, batch []cdc.ChangeEvent, attempts int, cause error) error {
+	if len(batch) == 1 {
+		w.log.Error("parking an event the sink would not accept",
+			"attempts", attempts, "position", batch[0].Position,
+			"table", batch[0].Qualified(), "err", cause)
+		return w.park(ctx, batch[0], attempts, cause)
+	}
+
+	w.log.Error("batch rejected; retrying its events individually to isolate the cause",
+		"events", len(batch), "attempts", attempts, "err", cause)
+
+	parked := 0
+	for _, ev := range batch {
+		if err := w.sink.Write(ctx, []cdc.ChangeEvent{ev}); err == nil {
+			continue
+		} else if ctx.Err() != nil {
+			return nil
+		} else {
+			w.log.Error("parking an event the sink would not accept",
+				"position", ev.Position, "table", ev.Qualified(), "err", err)
+			if perr := w.park(ctx, ev, attempts, err); perr != nil {
+				return perr
+			}
+			parked++
+		}
+	}
+	w.log.Error("dead-lettered events from a rejected batch", "parked", parked, "of", len(batch))
+	return nil
 }
 
 func recv(ctx context.Context, q <-chan seqEvent) (seqEvent, bool) {

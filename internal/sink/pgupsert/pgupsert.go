@@ -86,12 +86,23 @@ func (s *Sink) Write(ctx context.Context, batch []cdc.ChangeEvent) error {
 }
 
 func (s *Sink) statement(ev cdc.ChangeEvent) (string, []any, error) {
+	target := s.target(ev)
+
+	// TRUNCATE needs no key: every row goes. DELETE rather than TRUNCATE so it
+	// composes with the rest of the batch in one transaction, and so it is
+	// harmless to replay.
+	if ev.Op == cdc.OpTruncate {
+		if s.cfg.SoftDelete {
+			return fmt.Sprintf("UPDATE %s SET %s = now() WHERE %s IS NULL",
+				target, quoteIdent(s.cfg.DeletedCol), quoteIdent(s.cfg.DeletedCol)), nil, nil
+		}
+		return "DELETE FROM " + target, nil, nil
+	}
+
 	keys, err := s.keysFor(ev)
 	if err != nil {
 		return "", nil, err
 	}
-	target := s.target(ev)
-
 	if ev.Op == cdc.OpDelete {
 		return s.deleteStatement(ev, target, keys)
 	}
