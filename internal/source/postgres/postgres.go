@@ -20,6 +20,7 @@ import (
 
 	"github.com/aupv9/slipstream/internal/cdc"
 	"github.com/aupv9/slipstream/internal/config"
+	"github.com/aupv9/slipstream/internal/source"
 )
 
 // standbyInterval is how often we tell the server which LSN we have flushed.
@@ -84,9 +85,9 @@ func (r *Reader) Close() error {
 	return err
 }
 
-// ReadChanges resumes from `from`, or bootstraps (snapshot + slot creation)
-// when `from` is empty, then streams until ctx is cancelled.
-func (r *Reader) ReadChanges(ctx context.Context, from string, out chan<- cdc.ChangeEvent) error {
+// ReadChanges resumes from req.From, or bootstraps (snapshot + slot creation),
+// then streams until ctx is cancelled.
+func (r *Reader) ReadChanges(ctx context.Context, req source.ReadRequest, out chan<- cdc.ChangeEvent) error {
 	if r.cfg.DSN == "" {
 		return errors.New("postgres: dsn is required")
 	}
@@ -109,13 +110,18 @@ func (r *Reader) ReadChanges(ctx context.Context, from string, out chan<- cdc.Ch
 	defer r.Close()
 
 	var startLSN pglogrepl.LSN
-	if from != "" {
-		if startLSN, err = pglogrepl.ParseLSN(from); err != nil {
-			return fmt.Errorf("postgres: stored offset %q is not an LSN: %w", from, err)
+	if req.From != "" && !req.ForceBootstrap {
+		if startLSN, err = pglogrepl.ParseLSN(req.From); err != nil {
+			return fmt.Errorf("postgres: stored offset %q is not an LSN: %w", req.From, err)
 		}
 		r.log.Info("resuming from stored offset", "lsn", startLSN)
 	} else {
-		if startLSN, err = r.bootstrap(ctx, admin, out); err != nil {
+		if req.From != "" {
+			r.log.Warn("discarding the stored offset and snapshotting again",
+				"offset", req.From,
+				"reason", "the previous snapshot did not complete, so this offset covers only part of the data")
+		}
+		if startLSN, err = r.bootstrap(ctx, admin, req, out); err != nil {
 			return err
 		}
 	}
@@ -154,7 +160,25 @@ func (r *Reader) connectReplication(ctx context.Context) (*pgconn.PgConn, error)
 // older is in the snapshot, everything newer arrives on the stream, and the
 // boundary has neither a gap nor an overlap. The replication connection must
 // stay open the whole time or the exported snapshot is discarded.
-func (r *Reader) bootstrap(ctx context.Context, admin *pgx.Conn, out chan<- cdc.ChangeEvent) (pglogrepl.LSN, error) {
+//
+// A slot left over from an earlier attempt is dropped rather than reused. We
+// only reach bootstrap when there is no offset worth resuming from, and an
+// exported snapshot can only be taken by a freshly created slot — reusing the
+// old one would mean streaming forward without ever reading the rows the
+// interrupted snapshot never got to.
+func (r *Reader) bootstrap(ctx context.Context, admin *pgx.Conn, req source.ReadRequest, out chan<- cdc.ChangeEvent) (pglogrepl.LSN, error) {
+	if err := r.dropSlotIfExists(ctx, admin); err != nil {
+		return 0, err
+	}
+
+	// Mark the snapshot as started before anything is emitted, so an instance
+	// that dies partway through leaves evidence that its offset is partial.
+	if req.Hooks != nil {
+		if err := req.Hooks.SnapshotStarted(ctx); err != nil {
+			return 0, fmt.Errorf("postgres: record snapshot start: %w", err)
+		}
+	}
+
 	action, err := snapshotAction(ctx, admin, r.cfg.Snapshot)
 	if err != nil {
 		return 0, err
@@ -166,21 +190,13 @@ func (r *Reader) bootstrap(ctx context.Context, admin *pgx.Conn, out chan<- cdc.
 			SnapshotAction: action,
 		})
 	if err != nil {
-		if !isDuplicateObject(err) {
-			return 0, fmt.Errorf("postgres: create slot %s: %w", r.cfg.Slot, err)
+		if isDuplicateObject(err) {
+			// We just dropped it, so someone else recreated it: another
+			// instance believes it is the leader. Stop rather than race it.
+			return 0, fmt.Errorf("postgres: slot %s reappeared during bootstrap; "+
+				"another instance may be reading this source: %w", r.cfg.Slot, err)
 		}
-		// The slot outlived our offset row (a wiped control plane, or a
-		// pipeline renamed back). Its confirmed_flush_lsn is a valid resume
-		// point and every change since then is still in WAL, so streaming
-		// from it loses nothing — but we cannot snapshot consistently
-		// against it, so we must not pretend to.
-		lsn, lerr := r.slotConfirmedFlushLSN(ctx, admin)
-		if lerr != nil {
-			return 0, lerr
-		}
-		r.log.Warn("replication slot already exists; skipping snapshot and resuming from the slot",
-			"lsn", lsn)
-		return lsn, nil
+		return 0, fmt.Errorf("postgres: create slot %s: %w", r.cfg.Slot, err)
 	}
 
 	consistent, err := pglogrepl.ParseLSN(slot.ConsistentPoint)
@@ -189,14 +205,57 @@ func (r *Reader) bootstrap(ctx context.Context, admin *pgx.Conn, out chan<- cdc.
 	}
 	r.log.Info("created replication slot", "consistent_point", consistent, "snapshot", slot.SnapshotName)
 
-	if !r.cfg.Snapshot {
+	if r.cfg.Snapshot {
+		if err := r.snapshot(ctx, admin, slot.SnapshotName, consistent, out); err != nil {
+			return 0, err
+		}
+	} else {
 		r.log.Info("snapshot disabled; streaming only from the slot's consistent point")
-		return consistent, nil
 	}
-	if err := r.snapshot(ctx, admin, slot.SnapshotName, consistent, out); err != nil {
-		return 0, err
+
+	if req.Hooks != nil {
+		if err := req.Hooks.SnapshotCompleted(ctx, consistent.String()); err != nil {
+			return 0, fmt.Errorf("postgres: record snapshot completion: %w", err)
+		}
 	}
 	return consistent, nil
+}
+
+// dropSlotIfExists removes a slot left behind by an earlier attempt. A slot
+// still held open by a dying instance cannot be dropped, so this waits for it
+// to go inactive rather than giving up immediately.
+func (r *Reader) dropSlotIfExists(ctx context.Context, admin *pgx.Conn) error {
+	var activePID *int32
+	err := admin.QueryRow(ctx,
+		`SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1`, r.cfg.Slot).Scan(&activePID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("postgres: inspect slot %s: %w", r.cfg.Slot, err)
+	}
+
+	r.log.Warn("dropping a replication slot left by an earlier attempt",
+		"slot", r.cfg.Slot, "held_by_pid", activePID)
+
+	// The previous holder's backend may take a moment to be reaped.
+	deadline := time.Now().Add(30 * time.Second)
+	for attempt := 1; ; attempt++ {
+		_, err := admin.Exec(ctx, `SELECT pg_drop_replication_slot($1)`, r.cfg.Slot)
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("postgres: could not drop slot %s after %d attempts "+
+				"(still in use by another reader?): %w", r.cfg.Slot, attempt, err)
+		}
+		r.log.Warn("slot still in use; retrying the drop", "slot", r.cfg.Slot, "err", err)
+		select {
+		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // snapshotAction picks the option syntax the server understands. Postgres 15
@@ -529,21 +588,6 @@ func (r *Reader) capturedTables(ctx context.Context, admin *pgx.Conn) ([]table, 
 		out = append(out, t)
 	}
 	return out, rows.Err()
-}
-
-func (r *Reader) slotConfirmedFlushLSN(ctx context.Context, admin *pgx.Conn) (pglogrepl.LSN, error) {
-	var raw string
-	err := admin.QueryRow(ctx,
-		`SELECT coalesce(confirmed_flush_lsn, restart_lsn)::text
-		   FROM pg_replication_slots WHERE slot_name = $1`, r.cfg.Slot).Scan(&raw)
-	if err != nil {
-		return 0, fmt.Errorf("postgres: read slot %s: %w", r.cfg.Slot, err)
-	}
-	lsn, err := pglogrepl.ParseLSN(raw)
-	if err != nil {
-		return 0, fmt.Errorf("postgres: parse slot lsn %q: %w", raw, err)
-	}
-	return lsn, nil
 }
 
 func emit(ctx context.Context, out chan<- cdc.ChangeEvent, ev cdc.ChangeEvent) error {

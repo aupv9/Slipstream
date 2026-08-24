@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: fmt, vet, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - run: go vet ./...
+      - run: go build ./...
+
+      # Integration tests skip themselves without their DSN variables, so this
+      # job stays fast and dependency-free.
+      - name: unit tests
+        run: go test ./... -count=1
+
+  integration:
+    name: integration tests and failover checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      # A service container cannot take server flags, and logical replication
+      # needs wal_level=logical, so the server is started directly.
+      - name: start postgres with logical WAL
+        run: |
+          docker run -d --name pg -p 5432:5432 \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            postgres:16 \
+            -c wal_level=logical \
+            -c max_replication_slots=10 \
+            -c max_wal_senders=10
+          for _ in $(seq 1 60); do
+            docker exec pg pg_isready -U postgres -q && break
+            sleep 1
+          done
+          docker exec pg pg_isready -U postgres
+          for db in app mirror slipstream_cp; do
+            docker exec pg createdb -U postgres "$db"
+          done
+
+      - name: install psql
+        run: command -v psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
+
+      - name: integration tests
+        env:
+          SLIPSTREAM_TEST_CP_DSN: postgres://postgres@127.0.0.1:5432/slipstream_cp
+          SLIPSTREAM_TEST_SOURCE_DSN: postgres://postgres@127.0.0.1:5432/app
+        run: go test ./... -count=1 -race
+
+      # The guarantees that only show up across a process boundary: a leader
+      # killed mid-stream, and a leader killed mid-snapshot.
+      - name: failover verification
+        env:
+          CP_DSN: postgres://postgres@127.0.0.1:5432/slipstream_cp
+          SRC_DSN: postgres://postgres@127.0.0.1:5432/app
+          MIRROR_DSN: postgres://postgres@127.0.0.1:5432/mirror
+        run: scripts/verify-failover.sh
+
+      - name: snapshot crash verification
+        env:
+          CP_DSN: postgres://postgres@127.0.0.1:5432/slipstream_cp
+          SRC_DSN: postgres://postgres@127.0.0.1:5432/app
+          MIRROR_DSN: postgres://postgres@127.0.0.1:5432/mirror
+        run: scripts/verify-snapshot-crash.sh
+
+      - name: postgres log on failure
+        if: failure()
+        run: docker logs pg | tail -50

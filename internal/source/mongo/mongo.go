@@ -40,7 +40,7 @@ func New(cfg config.MongoDB, sourceID string, log *slog.Logger) *Reader {
 func (r *Reader) Name() string { return "mongodb" }
 
 // ReadChanges is not implemented yet.
-func (r *Reader) ReadChanges(context.Context, string, chan<- cdc.ChangeEvent) error {
+func (r *Reader) ReadChanges(context.Context, source.ReadRequest, chan<- cdc.ChangeEvent) error {
 	return &source.ErrNotImplemented{
 		Source: "mongodb",
 		Reason: "change-stream reader is roadmap step 4; see the package comment for the clusterTime snapshot plan",

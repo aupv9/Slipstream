@@ -191,3 +191,89 @@ func (s *Store) AdvanceSinkCursor(ctx context.Context, pipelineID, holder, sink,
 	}
 	return nil
 }
+
+// Snapshot phases.
+const (
+	// SnapshotRunning means an initial snapshot started but has not finished.
+	SnapshotRunning = "running"
+	// SnapshotDone means the initial snapshot completed, so the stored offset
+	// covers the whole dataset and can be resumed from.
+	SnapshotDone = "done"
+)
+
+// BeginSnapshot records that an initial snapshot is starting. Any previous
+// state for the pipeline is overwritten, because a new bootstrap supersedes it.
+func (s *Store) BeginSnapshot(ctx context.Context, pipelineID, holder, slot string) error {
+	tag, err := s.pool.Exec(ctx,
+		`INSERT INTO snapshot_state (pipeline_id, phase, slot_name, started_at, completed_at, consistent_lsn)
+		 SELECT $1, 'running', $3, now(), NULL, ''
+		   FROM leases
+		  WHERE pipeline_id = $1 AND holder = $2 AND expires_at > now()
+		 ON CONFLICT (pipeline_id) DO UPDATE
+		    SET phase = 'running',
+		        slot_name = excluded.slot_name,
+		        started_at = now(),
+		        completed_at = NULL,
+		        consistent_lsn = ''`,
+		pipelineID, holder, slot)
+	if err != nil {
+		return fmt.Errorf("controlplane: begin snapshot: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// CompleteSnapshot marks the snapshot finished. Only after this does the
+// pipeline offset describe the complete dataset.
+func (s *Store) CompleteSnapshot(ctx context.Context, pipelineID, holder, consistentLSN string) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE snapshot_state
+		    SET phase = 'done', completed_at = now(), consistent_lsn = $3
+		  WHERE pipeline_id = $1
+		    AND EXISTS (SELECT 1 FROM leases
+		                 WHERE pipeline_id = $1 AND holder = $2 AND expires_at > now())`,
+		pipelineID, holder, consistentLSN)
+	if err != nil {
+		return fmt.Errorf("controlplane: complete snapshot: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// SnapshotPhase reports the recorded phase. found is false when no snapshot has
+// ever been recorded for the pipeline.
+func (s *Store) SnapshotPhase(ctx context.Context, pipelineID string) (phase string, found bool, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT phase FROM snapshot_state WHERE pipeline_id = $1`, pipelineID).Scan(&phase)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("controlplane: read snapshot state: %w", err)
+	}
+	return phase, true, nil
+}
+
+// DeadLetter parks an event a sink kept rejecting. The pipeline advances past
+// it, so this is the one place where an event is deliberately not delivered —
+// it is only reachable for sinks explicitly configured with
+// on_failure = dead_letter.
+func (s *Store) DeadLetter(ctx context.Context, pipelineID, holder, sinkName, position string, attempts int, cause string, payload []byte) error {
+	tag, err := s.pool.Exec(ctx,
+		`INSERT INTO dead_letters (pipeline_id, sink_name, position, attempts, error, event)
+		 SELECT $1, $3, $4, $5, $6, $7::jsonb
+		   FROM leases
+		  WHERE pipeline_id = $1 AND holder = $2 AND expires_at > now()`,
+		pipelineID, holder, sinkName, position, attempts, cause, string(payload))
+	if err != nil {
+		return fmt.Errorf("controlplane: dead letter: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}

@@ -34,3 +34,31 @@ CREATE TABLE IF NOT EXISTS sink_cursor (
 
 COMMENT ON TABLE sink_cursor IS
     'Per-sink progress. Sinks advance independently; the slowest one defines the pipeline offset, so a slow sink never causes data loss and never blocks a fast one beyond its queue.';
+
+CREATE TABLE IF NOT EXISTS snapshot_state (
+    pipeline_id    text        PRIMARY KEY,
+    phase          text        NOT NULL CHECK (phase IN ('running', 'done')),
+    slot_name      text        NOT NULL DEFAULT '',
+    consistent_lsn text        NOT NULL DEFAULT '',
+    started_at     timestamptz NOT NULL DEFAULT now(),
+    completed_at   timestamptz
+);
+
+COMMENT ON TABLE snapshot_state IS
+    'Whether the initial snapshot finished. An offset written while phase = running covers only part of the snapshot, so it must never be resumed from: the pipeline re-bootstraps instead.';
+
+CREATE TABLE IF NOT EXISTS dead_letters (
+    id          bigserial   PRIMARY KEY,
+    pipeline_id text        NOT NULL,
+    sink_name   text        NOT NULL,
+    position    text        NOT NULL,
+    attempts    integer     NOT NULL,
+    error       text        NOT NULL,
+    event       jsonb       NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE dead_letters IS
+    'Events a sink rejected up to its attempt limit, parked here so one poison event cannot stall the pipeline forever. Only written by sinks configured with on_failure = dead_letter.';
+
+CREATE INDEX IF NOT EXISTS dead_letters_pipeline_idx ON dead_letters (pipeline_id, created_at DESC);
