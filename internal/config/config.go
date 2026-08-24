@@ -92,6 +92,11 @@ type Postgres struct {
 	Publication string `yaml:"publication"`
 	// Tables are "schema.table" names to capture.
 	Tables []string `yaml:"tables"`
+	// AutoAddTables adds tables that appear in Tables but are missing from an
+	// existing publication. Those tables are captured streaming-only: they get
+	// no snapshot, so rows written before they were added are never delivered.
+	// Left false, a mismatch stops the pipeline with instructions instead.
+	AutoAddTables bool `yaml:"auto_add_tables"`
 	// Snapshot takes an initial consistent snapshot when no offset exists.
 	Snapshot bool `yaml:"snapshot"`
 }
@@ -127,14 +132,29 @@ type SinkConfig struct {
 	// BatchMaxEvents and BatchMaxWait control write batching.
 	BatchMaxEvents int      `yaml:"batch_max_events"`
 	BatchMaxWait   Duration `yaml:"batch_max_wait"`
-	// RetryInitial and RetryMax bound the write backoff. Retries never give
-	// up: dropping an event would break at-least-once.
+	// RetryInitial and RetryMax bound the write backoff.
 	RetryInitial Duration `yaml:"retry_initial"`
 	RetryMax     Duration `yaml:"retry_max"`
+	// OnFailure decides what happens when a sink keeps rejecting a batch.
+	//
+	// "retry" (the default) retries forever: nothing is ever lost, but one
+	// permanently rejected event stalls this sink until someone intervenes.
+	// "dead_letter" gives up after MaxAttempts, parks the offending events in
+	// the control plane's dead_letters table and moves on — the only place
+	// Slipstream deliberately stops delivering an event.
+	OnFailure string `yaml:"on_failure"`
+	// MaxAttempts is the attempt limit for OnFailure = dead_letter.
+	MaxAttempts int `yaml:"max_attempts"`
 
 	Webhook  WebhookSink  `yaml:"webhook"`
 	PGUpsert PGUpsertSink `yaml:"pgupsert"`
 }
+
+// Failure policies for a sink that keeps rejecting a batch.
+const (
+	OnFailureRetry      = "retry"
+	OnFailureDeadLetter = "dead_letter"
+)
 
 // WebhookSink posts batches of events as JSON.
 type WebhookSink struct {
@@ -232,6 +252,9 @@ func (c *Config) applyDefaults() {
 		if s.PGUpsert.DeletedCol == "" {
 			s.PGUpsert.DeletedCol = "_deleted_at"
 		}
+		if s.OnFailure == "" {
+			s.OnFailure = OnFailureRetry
+		}
 	}
 }
 
@@ -262,6 +285,23 @@ func (c *Config) validate() error {
 			return fmt.Errorf("config: duplicate sink name %q; names key the sink_cursor rows", s.Name)
 		}
 		seen[s.Name] = true
+
+		switch s.OnFailure {
+		case OnFailureRetry:
+			if s.MaxAttempts > 0 {
+				return fmt.Errorf("config: sink %q sets max_attempts with on_failure: retry, "+
+					"which would drop events once the limit is hit; use on_failure: dead_letter "+
+					"to park them instead, or remove max_attempts to retry forever", s.Name)
+			}
+		case OnFailureDeadLetter:
+			if s.MaxAttempts <= 0 {
+				return fmt.Errorf("config: sink %q uses on_failure: dead_letter but no max_attempts, "+
+					"so nothing would ever be parked", s.Name)
+			}
+		default:
+			return fmt.Errorf("config: sink %q has on_failure %q, want %q or %q",
+				s.Name, s.OnFailure, OnFailureRetry, OnFailureDeadLetter)
+		}
 	}
 	return nil
 }

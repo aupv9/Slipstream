@@ -61,6 +61,10 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.Pipeline.Sinks[0].QueueSize == 0 || cfg.Pipeline.Sinks[0].BatchMaxEvents == 0 {
 		t.Error("sink batching defaults were not applied")
 	}
+	if cfg.Pipeline.Sinks[0].OnFailure != OnFailureRetry {
+		t.Errorf("on_failure = %q, want %q: never drop by default",
+			cfg.Pipeline.Sinks[0].OnFailure, OnFailureRetry)
+	}
 }
 
 func TestLoadExpandsEnvReferences(t *testing.T) {
@@ -105,6 +109,21 @@ pipeline:
     type: postgres
 `,
 			want: "must list at least one sink",
+		},
+		"max_attempts without dead_letter": {
+			body: minimal + `      max_attempts: 3
+`,
+			want: "max_attempts with on_failure: retry",
+		},
+		"dead_letter without max_attempts": {
+			body: minimal + `      on_failure: dead_letter
+`,
+			want: "no max_attempts",
+		},
+		"unknown failure policy": {
+			body: minimal + `      on_failure: explode
+`,
+			want: `on_failure "explode"`,
 		},
 		"unknown duration": {
 			body: strings.Replace(minimal, "  dsn: postgres://cp/slipstream",

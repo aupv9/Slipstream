@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -573,5 +574,144 @@ func TestInterruptedSnapshotIsRedoneFromScratch(t *testing.T) {
 	}
 	if _, completed, _ := hooks2.state(); completed != 1 {
 		t.Errorf("snapshot completion recorded %d times, want 1", completed)
+	}
+}
+
+// A dropped TRUNCATE leaves sinks holding every row the source just discarded,
+// so it must be delivered as its own event.
+func TestTruncateIsDelivered(t *testing.T) {
+	f := newFixture(t, "truncate")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if _, err := f.conn.Exec(ctx, fmt.Sprintf(
+		`INSERT INTO %s SELECT g, 'row-' || g FROM generate_series(1, 5) g`, f.table)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	reader := New(f.readerConfig(), "src", quietLogger())
+	events := make(chan cdc.ChangeEvent, 128)
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go func() {
+		defer close(events)
+		_ = reader.ReadChanges(runCtx, source.ReadRequest{}, events)
+	}()
+
+	waitFor(t, events, func(ev cdc.ChangeEvent) bool { return ev.Op == cdc.OpRead })
+
+	if _, err := f.conn.Exec(ctx, "TRUNCATE "+f.table); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	ev := waitFor(t, events, func(ev cdc.ChangeEvent) bool { return ev.Op == cdc.OpTruncate })
+	if ev.Table != f.table || ev.Schema != "public" {
+		t.Errorf("truncate event names %s.%s, want public.%s", ev.Schema, ev.Table, f.table)
+	}
+	if ev.Before != nil || ev.After != nil {
+		t.Error("a truncate event carries no row images")
+	}
+	if ev.Position == "" {
+		t.Error("truncate event has no position")
+	}
+}
+
+// A table added to the config after the publication exists used to be ignored
+// in silence: the operator believes it replicates when it does not.
+func TestConfiguredTableMissingFromPublicationIsRefused(t *testing.T) {
+	f := newFixture(t, "drift")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// First run creates the publication covering only the fixture table.
+	reader := New(f.readerConfig(), "src", quietLogger())
+	events := make(chan cdc.ChangeEvent, 16)
+	runCtx, stop := context.WithCancel(ctx)
+	go func() {
+		defer close(events)
+		_ = reader.ReadChanges(runCtx, source.ReadRequest{}, events)
+	}()
+	waitForStreaming(t, f, ctx)
+	stop()
+	for range events {
+	}
+	_ = reader.Close()
+
+	// A second table appears in the config later.
+	late := f.table + "_late"
+	if _, err := f.conn.Exec(ctx, fmt.Sprintf(
+		`CREATE TABLE %s (id bigint PRIMARY KEY, note text)`, late)); err != nil {
+		t.Fatalf("create late table: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.conn.Exec(context.Background(), "DROP TABLE IF EXISTS "+late)
+	})
+	if _, err := f.conn.Exec(ctx, fmt.Sprintf(`INSERT INTO %s VALUES (1, 'existing')`, late)); err != nil {
+		t.Fatalf("seed late table: %v", err)
+	}
+
+	cfg := f.readerConfig()
+	cfg.Tables = append(cfg.Tables, "public."+late)
+
+	strict := New(cfg, "src", quietLogger())
+	err := strict.ReadChanges(ctx, source.ReadRequest{From: "0/1"}, make(chan cdc.ChangeEvent, 1))
+	if err == nil {
+		t.Fatal("a table missing from the publication must stop the pipeline, not be ignored")
+	}
+	if !strings.Contains(err.Error(), late) || !strings.Contains(err.Error(), "auto_add_tables") {
+		t.Fatalf("the error should name the table and the opt-in flag, got: %v", err)
+	}
+
+	// With the opt-in, the table is added and captured streaming-only.
+	cfg.AutoAddTables = true
+	lenient := New(cfg, "src", quietLogger())
+	events2 := make(chan cdc.ChangeEvent, 128)
+	runCtx2, stop2 := context.WithCancel(ctx)
+	defer stop2()
+	go func() {
+		defer close(events2)
+		_ = lenient.ReadChanges(runCtx2, source.ReadRequest{From: "0/1"}, events2)
+	}()
+	waitForStreaming(t, f, ctx)
+
+	if _, err := f.conn.Exec(ctx, fmt.Sprintf(`INSERT INTO %s VALUES (2, 'after-add')`, late)); err != nil {
+		t.Fatalf("insert into late table: %v", err)
+	}
+	ev := waitFor(t, events2, func(ev cdc.ChangeEvent) bool {
+		return ev.Table == late && ev.Op == cdc.OpCreate
+	})
+	if got := ev.After["note"]; got != "after-add" {
+		t.Errorf("late table event = %v, want the inserted row", got)
+	}
+
+	// Row 1 was written before the table joined the publication, so it is
+	// deliberately not delivered: that is what the warning is about.
+	select {
+	case stray := <-events2:
+		if stray.Table == late {
+			if note, _ := stray.After["note"].(string); note == "existing" {
+				t.Error("a pre-existing row appeared without a snapshot; that should not be possible")
+			}
+		}
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// waitForStreaming waits until the reader has an active slot, which means it
+// finished bootstrapping and is consuming the stream.
+func waitForStreaming(t *testing.T, f *fixture, ctx context.Context) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var active bool
+		err := f.conn.QueryRow(ctx,
+			`SELECT active FROM pg_replication_slots WHERE slot_name = $1`, f.slot).Scan(&active)
+		if err == nil && active {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the reader never started streaming (last err: %v)", err)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

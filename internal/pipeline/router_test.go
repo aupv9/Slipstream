@@ -15,9 +15,18 @@ import (
 
 // fakeStore records what the router commits.
 type fakeStore struct {
-	mu      sync.Mutex
-	offsets []string
-	cursors map[string]string
+	mu       sync.Mutex
+	offsets  []string
+	cursors  map[string]string
+	parked   []parkedEvent
+	parkFail error
+}
+
+type parkedEvent struct {
+	sink     string
+	position string
+	attempts int
+	cause    string
 }
 
 func newFakeStore() *fakeStore {
@@ -36,6 +45,22 @@ func (f *fakeStore) AdvanceSinkCursor(_ context.Context, _, _, sinkName, positio
 	defer f.mu.Unlock()
 	f.cursors[sinkName] = position
 	return nil
+}
+
+func (f *fakeStore) DeadLetter(_ context.Context, _, _, sinkName, position string, attempts int, cause string, _ []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.parkFail != nil {
+		return f.parkFail
+	}
+	f.parked = append(f.parked, parkedEvent{sink: sinkName, position: position, attempts: attempts, cause: cause})
+	return nil
+}
+
+func (f *fakeStore) deadLettered() []parkedEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]parkedEvent(nil), f.parked...)
 }
 
 func (f *fakeStore) lastOffset() string {
@@ -64,6 +89,7 @@ type fakeSink struct {
 	failFirst int           // fail this many Write calls before succeeding
 	delay     time.Duration // per-write delay, to make a sink the slow one
 	gate      chan struct{} // if set, each Write waits for a token
+	rejectID  int           // if non-zero, any batch containing this id fails
 }
 
 func (s *fakeSink) Name() string { return s.name }
@@ -89,6 +115,13 @@ func (s *fakeSink) Write(ctx context.Context, batch []cdc.ChangeEvent) error {
 	s.attempts++
 	if s.attempts <= s.failFirst {
 		return fmt.Errorf("sink %s: synthetic failure %d", s.name, s.attempts)
+	}
+	if s.rejectID != 0 {
+		for _, ev := range batch {
+			if id, ok := ev.After["id"].(int); ok && id == s.rejectID {
+				return fmt.Errorf("sink %s: refusing id %d", s.name, s.rejectID)
+			}
+		}
 	}
 	s.got = append(s.got, batch...)
 	return nil
@@ -334,4 +367,103 @@ func (a *recordingAcker) positions() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]string(nil), a.seen...)
+}
+
+// A sink configured to dead-letter must park what it cannot deliver and let the
+// pipeline move on, rather than stalling behind one poison event.
+func TestRouterDeadLettersAfterMaxAttempts(t *testing.T) {
+	store := newFakeStore()
+	broken := &fakeSink{name: "broken", failFirst: 1 << 30} // never accepts anything
+	cfg := sinkCfg("broken")
+	cfg.BatchMaxEvents = 1
+	cfg.OnFailure = config.OnFailureDeadLetter
+	cfg.MaxAttempts = 2
+
+	r := NewRouter("p1", "inst1", store, []config.SinkConfig{cfg}, []sink.Sink{broken},
+		5*time.Millisecond, nil, testLogger())
+
+	in := events(3)
+	if err := feedAndRun(t, r, in); err != nil {
+		t.Fatalf("router returned: %v", err)
+	}
+
+	parked := store.deadLettered()
+	if len(parked) != len(in) {
+		t.Fatalf("parked %d events, want %d", len(parked), len(in))
+	}
+	for i, p := range parked {
+		if p.position != in[i].Position {
+			t.Errorf("parked[%d] position = %q, want %q", i, p.position, in[i].Position)
+		}
+		if p.attempts != 2 {
+			t.Errorf("parked[%d] attempts = %d, want the configured limit 2", i, p.attempts)
+		}
+		if p.cause == "" {
+			t.Errorf("parked[%d] recorded no cause", i)
+		}
+	}
+	// The pipeline must have advanced past them, not stalled.
+	if want := in[len(in)-1].Position; store.lastOffset() != want {
+		t.Fatalf("offset = %q, want %q: dead-lettering should let the pipeline advance",
+			store.lastOffset(), want)
+	}
+}
+
+// One bad event in a batch must not take the good ones down with it.
+func TestRouterDeadLetterIsolatesOnlyTheBadEvent(t *testing.T) {
+	store := newFakeStore()
+	picky := &fakeSink{name: "picky", rejectID: 3}
+	cfg := sinkCfg("picky")
+	cfg.BatchMaxEvents = 100
+	cfg.OnFailure = config.OnFailureDeadLetter
+	cfg.MaxAttempts = 2
+
+	r := NewRouter("p1", "inst1", store, []config.SinkConfig{cfg}, []sink.Sink{picky},
+		5*time.Millisecond, nil, testLogger())
+
+	in := events(5)
+	if err := feedAndRun(t, r, in); err != nil {
+		t.Fatalf("router returned: %v", err)
+	}
+
+	parked := store.deadLettered()
+	if len(parked) != 1 {
+		t.Fatalf("parked %d events, want exactly the one the sink refuses: %+v", len(parked), parked)
+	}
+	if parked[0].position != in[2].Position {
+		t.Errorf("parked the wrong event: %q, want %q", parked[0].position, in[2].Position)
+	}
+
+	delivered := picky.events()
+	if len(delivered) != len(in)-1 {
+		t.Fatalf("sink accepted %d events, want %d (all but the rejected one)", len(delivered), len(in)-1)
+	}
+	for _, ev := range delivered {
+		if id, _ := ev.After["id"].(int); id == 3 {
+			t.Fatal("the rejected event was delivered after all")
+		}
+	}
+}
+
+// If the dead-letter write itself fails, the pipeline must not advance: losing
+// both the delivery and the record of it would be silent data loss.
+func TestRouterDoesNotAdvanceWhenParkingFails(t *testing.T) {
+	store := newFakeStore()
+	store.parkFail = errors.New("control plane unavailable")
+	broken := &fakeSink{name: "broken", failFirst: 1 << 30}
+	cfg := sinkCfg("broken")
+	cfg.BatchMaxEvents = 1
+	cfg.OnFailure = config.OnFailureDeadLetter
+	cfg.MaxAttempts = 1
+
+	r := NewRouter("p1", "inst1", store, []config.SinkConfig{cfg}, []sink.Sink{broken},
+		5*time.Millisecond, nil, testLogger())
+
+	err := feedAndRun(t, r, events(2))
+	if err == nil {
+		t.Fatal("expected the run to fail so the events are replayed after a restart")
+	}
+	if store.lastOffset() != "" {
+		t.Fatalf("offset advanced to %q despite the parking failure", store.lastOffset())
+	}
 }

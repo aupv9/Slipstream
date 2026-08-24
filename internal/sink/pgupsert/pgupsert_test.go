@@ -168,3 +168,37 @@ func TestQuotingResistsInjectionThroughIdentifiers(t *testing.T) {
 		t.Errorf("sql = %q, want %q", sql, want)
 	}
 }
+
+// TRUNCATE removes every row, so it must reach the target as a statement of its
+// own — and it needs no configured key, since no row is identified.
+func TestTruncateClearsTheTarget(t *testing.T) {
+	s := newTestSink(config.PGUpsertSink{})
+	sql, args, err := s.statement(cdc.ChangeEvent{
+		Schema: "public", Table: "users", Op: cdc.OpTruncate,
+	})
+	if err != nil {
+		t.Fatalf("statement: %v", err)
+	}
+	if want := `DELETE FROM "public"."users"`; sql != want {
+		t.Errorf("sql = %q, want %q", sql, want)
+	}
+	if len(args) != 0 {
+		t.Errorf("args = %v, want none", args)
+	}
+}
+
+func TestTruncateWithSoftDeleteStampsRemainingRows(t *testing.T) {
+	cfg := keyed()
+	cfg.SoftDelete = true
+	s := newTestSink(cfg)
+
+	sql, _, err := s.statement(cdc.ChangeEvent{
+		Schema: "public", Table: "users", Op: cdc.OpTruncate,
+	})
+	if err != nil {
+		t.Fatalf("statement: %v", err)
+	}
+	if want := `UPDATE "public"."users" SET "_deleted_at" = now() WHERE "_deleted_at" IS NULL`; sql != want {
+		t.Errorf("sql = %q, want %q", sql, want)
+	}
+}
