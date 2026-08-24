@@ -43,7 +43,7 @@ func New(cfg config.MySQL, sourceID string, log *slog.Logger) *Reader {
 func (r *Reader) Name() string { return "mysql" }
 
 // ReadChanges is not implemented yet.
-func (r *Reader) ReadChanges(context.Context, string, chan<- cdc.ChangeEvent) error {
+func (r *Reader) ReadChanges(context.Context, source.ReadRequest, chan<- cdc.ChangeEvent) error {
 	return &source.ErrNotImplemented{
 		Source: "mysql",
 		Reason: "binlog reader is roadmap step 4; see the package comment for the GTID snapshot plan",

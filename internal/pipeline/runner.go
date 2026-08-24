@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -159,6 +160,83 @@ func (r *Runner) heartbeat(ctx context.Context, cancel context.CancelFunc) {
 	}
 }
 
+// resumeDecision is where a run starts from, and why.
+type resumeDecision struct {
+	From           string
+	ForceBootstrap bool
+	Reason         string
+}
+
+// planResume decides whether a stored offset may be resumed from.
+//
+// An offset is only trustworthy once the initial snapshot has been recorded as
+// complete. While a snapshot runs, sinks accept its rows and the offset
+// advances to the slot's consistent point — so an instance that dies midway
+// leaves behind an offset that looks perfectly resumable but only covers the
+// part of the snapshot that had been read. Resuming from it streams on from
+// there and the unread rows are never delivered: the pipeline looks healthy and
+// silently misses data forever. When in doubt, snapshot again; a redundant
+// snapshot costs time, a skipped one costs data.
+func planResume(offset string, offsetFound bool, phase string, phaseFound bool) resumeDecision {
+	switch {
+	case !phaseFound:
+		return resumeDecision{
+			From:           offset,
+			ForceBootstrap: true,
+			Reason:         "no completed snapshot is recorded for this pipeline",
+		}
+	case phase == controlplane.SnapshotRunning:
+		return resumeDecision{
+			From:           offset,
+			ForceBootstrap: true,
+			Reason:         "the previous snapshot was interrupted, so any stored offset is partial",
+		}
+	case !offsetFound:
+		return resumeDecision{
+			ForceBootstrap: true,
+			Reason:         "the snapshot is marked complete but no offset was ever committed",
+		}
+	default:
+		return resumeDecision{From: offset, Reason: "resuming from the committed offset"}
+	}
+}
+
+// snapshotHooks persists the snapshot lifecycle to the control plane. Writes
+// are fenced on the lease, so a leader that has been superseded cannot mark a
+// snapshot complete.
+type snapshotHooks struct {
+	store      *controlplane.Store
+	pipelineID string
+	holder     string
+	capture    string
+	log        *slog.Logger
+}
+
+func (h *snapshotHooks) SnapshotStarted(ctx context.Context) error {
+	h.log.Info("snapshot starting", "capture", h.capture)
+	return h.store.BeginSnapshot(ctx, h.pipelineID, h.holder, h.capture)
+}
+
+func (h *snapshotHooks) SnapshotCompleted(ctx context.Context, position string) error {
+	h.log.Info("snapshot complete", "position", position)
+	return h.store.CompleteSnapshot(ctx, h.pipelineID, h.holder, position)
+}
+
+// captureID names the source-side capture object, for diagnostics in
+// snapshot_state.
+func captureID(cfg config.Source) string {
+	switch cfg.Type {
+	case "postgres", "postgresql":
+		return cfg.Postgres.Slot
+	case "mysql":
+		return fmt.Sprintf("server_id=%d", cfg.MySQL.ServerID)
+	case "mongodb", "mongo":
+		return cfg.MongoDB.Database
+	default:
+		return ""
+	}
+}
+
 // runPipeline reads from the source into the router until ctx ends.
 func (r *Runner) runPipeline(ctx context.Context) error {
 	reader, err := buildReader(r.cfg.Pipeline.Source, r.log)
@@ -173,14 +251,20 @@ func (r *Runner) runPipeline(ctx context.Context) error {
 	}
 	defer closeSinks(sinks, r.log)
 
-	from, found, err := r.store.LoadOffset(ctx, r.cfg.Pipeline.ID)
+	offset, offsetFound, err := r.store.LoadOffset(ctx, r.cfg.Pipeline.ID)
 	if err != nil {
 		return err
 	}
-	if found {
-		r.log.Info("resuming", "position", from)
+	phase, phaseFound, err := r.store.SnapshotPhase(ctx, r.cfg.Pipeline.ID)
+	if err != nil {
+		return err
+	}
+
+	plan := planResume(offset, offsetFound, phase, phaseFound)
+	if plan.ForceBootstrap {
+		r.log.Warn("bootstrapping from scratch", "reason", plan.Reason, "stored_offset", offset)
 	} else {
-		r.log.Info("no stored offset; the reader will take an initial snapshot")
+		r.log.Info("resuming", "position", plan.From)
 	}
 
 	if cursors, cerr := r.store.LoadSinkCursors(ctx, r.cfg.Pipeline.ID); cerr == nil {
@@ -197,11 +281,23 @@ func (r *Runner) runPipeline(ctx context.Context) error {
 	router := NewRouter(r.cfg.Pipeline.ID, r.cfg.InstanceID, r.store,
 		r.cfg.Pipeline.Sinks, sinks, r.cfg.Pipeline.CommitInterval.D(), acker, r.log)
 
+	req := source.ReadRequest{
+		From:           plan.From,
+		ForceBootstrap: plan.ForceBootstrap,
+		Hooks: &snapshotHooks{
+			store:      r.store,
+			pipelineID: r.cfg.Pipeline.ID,
+			holder:     r.cfg.InstanceID,
+			capture:    captureID(r.cfg.Pipeline.Source),
+			log:        r.log,
+		},
+	}
+
 	events := make(chan cdc.ChangeEvent, eventBuffer)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		defer close(events)
-		rerr := reader.ReadChanges(gctx, from, events)
+		rerr := reader.ReadChanges(gctx, req, events)
 		if rerr != nil && !errors.Is(rerr, context.Canceled) {
 			return rerr
 		}

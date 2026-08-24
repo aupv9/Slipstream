@@ -14,6 +14,7 @@ import (
 
 	"github.com/aupv9/slipstream/internal/cdc"
 	"github.com/aupv9/slipstream/internal/config"
+	"github.com/aupv9/slipstream/internal/source"
 )
 
 // These tests need a real Postgres with wal_level=logical. The whole point of
@@ -151,7 +152,7 @@ func TestSnapshotAndStreamHaveNoGapAndNoOverlap(t *testing.T) {
 	readErr := make(chan error, 1)
 	go func() {
 		defer close(events)
-		readErr <- reader.ReadChanges(readCtx, "", events)
+		readErr <- reader.ReadChanges(readCtx, source.ReadRequest{}, events)
 	}()
 
 	snapshotIDs := map[int64]bool{}
@@ -270,7 +271,7 @@ func TestResumeFromStoredOffsetSkipsTheSnapshot(t *testing.T) {
 	runCtx, stop := context.WithCancel(ctx)
 	go func() {
 		defer close(events)
-		_ = reader.ReadChanges(runCtx, "", events)
+		_ = reader.ReadChanges(runCtx, source.ReadRequest{}, events)
 	}()
 
 	first := waitFor(t, events, func(ev cdc.ChangeEvent) bool { return ev.Op == cdc.OpRead })
@@ -306,7 +307,7 @@ func TestResumeFromStoredOffsetSkipsTheSnapshot(t *testing.T) {
 	defer stop2()
 	go func() {
 		defer close(events2)
-		_ = resumed.ReadChanges(runCtx2, resumeFrom, events2)
+		_ = resumed.ReadChanges(runCtx2, source.ReadRequest{From: resumeFrom}, events2)
 	}()
 
 	seen := map[int64]bool{}
@@ -345,7 +346,7 @@ func TestStreamsUpdatesAndDeletesWithKeyImages(t *testing.T) {
 	defer stop()
 	go func() {
 		defer close(events)
-		_ = reader.ReadChanges(runCtx, "", events)
+		_ = reader.ReadChanges(runCtx, source.ReadRequest{}, events)
 	}()
 
 	waitFor(t, events, func(ev cdc.ChangeEvent) bool { return ev.Op == cdc.OpRead })
@@ -419,5 +420,158 @@ func insertedID(ev cdc.ChangeEvent) (int64, bool) {
 			return n, true
 		}
 		return 0, false
+	}
+}
+
+// recordingHooks captures the snapshot lifecycle a reader reports. The reader
+// calls it from its own goroutine, so access is guarded.
+type recordingHooks struct {
+	mu        sync.Mutex
+	started   int
+	completed int
+	position  string
+}
+
+func (h *recordingHooks) SnapshotStarted(context.Context) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.started++
+	return nil
+}
+
+func (h *recordingHooks) SnapshotCompleted(_ context.Context, position string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.completed++
+	h.position = position
+	return nil
+}
+
+func (h *recordingHooks) state() (started, completed int, position string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.started, h.completed, h.position
+}
+
+// awaitCompletion waits for the reader to report the snapshot finished, which
+// happens just after the last row is emitted.
+func (h *recordingHooks) awaitCompletion(t *testing.T) string {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		_, completed, position := h.state()
+		if completed > 0 {
+			return position
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the reader never reported the snapshot as complete")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestInterruptedSnapshotIsRedoneFromScratch is the regression test for a real
+// data-loss bug: sinks accept snapshot rows as they arrive, so the offset
+// advances to the slot's consistent point while the snapshot is still running.
+// An instance that dies midway leaves an offset that looks resumable but only
+// covers the rows already read. Resuming from it streamed forward and silently
+// never delivered the rest — the pipeline looked healthy while missing data
+// permanently. A run told to bootstrap must therefore drop the leftover slot
+// and read every row again.
+func TestInterruptedSnapshotIsRedoneFromScratch(t *testing.T) {
+	f := newFixture(t, "interrupted")
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	const rows = 5000
+	if _, err := f.conn.Exec(ctx, fmt.Sprintf(
+		`INSERT INTO %s SELECT g, 'row-' || g FROM generate_series(1, %d) g`, f.table, rows)); err != nil {
+		t.Fatalf("preload: %v", err)
+	}
+
+	// First attempt: die partway through the snapshot.
+	first := New(f.readerConfig(), "src", quietLogger())
+	events := make(chan cdc.ChangeEvent, 8192)
+	runCtx, kill := context.WithCancel(ctx)
+	hooks1 := &recordingHooks{}
+	go func() {
+		defer close(events)
+		_ = first.ReadChanges(runCtx, source.ReadRequest{Hooks: hooks1}, events)
+	}()
+
+	partial := 0
+	for partial < 100 {
+		if _, ok := insertedID(waitFor(t, events, func(ev cdc.ChangeEvent) bool { return ev.Op == cdc.OpRead })); ok {
+			partial++
+		}
+	}
+	kill()
+	for range events {
+	}
+	_ = first.Close()
+
+	started, completed, _ := hooks1.state()
+	if started != 1 {
+		t.Fatalf("snapshot start was recorded %d times, want 1", started)
+	}
+	if completed != 0 {
+		t.Fatal("an interrupted snapshot must not be recorded as complete")
+	}
+
+	// The leftover slot proves the interrupted attempt got that far.
+	var slots int
+	if err := f.conn.QueryRow(ctx,
+		`SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1`, f.slot).Scan(&slots); err != nil {
+		t.Fatalf("count slots: %v", err)
+	}
+	if slots != 1 {
+		t.Fatalf("expected the interrupted attempt to leave its slot behind, found %d", slots)
+	}
+
+	// Second attempt: an offset exists, but the snapshot never completed, so
+	// the pipeline forces a bootstrap.
+	second := New(f.readerConfig(), "src", quietLogger())
+	events2 := make(chan cdc.ChangeEvent, 8192)
+	runCtx2, stop2 := context.WithCancel(ctx)
+	defer stop2()
+	hooks2 := &recordingHooks{}
+	go func() {
+		defer close(events2)
+		_ = second.ReadChanges(runCtx2, source.ReadRequest{
+			From:           "0/1",
+			ForceBootstrap: true,
+			Hooks:          hooks2,
+		}, events2)
+	}()
+
+	seen := map[int64]bool{}
+	deadline := time.After(60 * time.Second)
+	for len(seen) < rows {
+		select {
+		case ev, ok := <-events2:
+			if !ok {
+				t.Fatalf("reader stopped after %d of %d rows", len(seen), rows)
+			}
+			if ev.Op != cdc.OpRead {
+				continue
+			}
+			if id, ok := insertedID(ev); ok {
+				seen[id] = true
+			}
+		case <-deadline:
+			t.Fatalf("only %d of %d rows were re-snapshotted", len(seen), rows)
+		}
+	}
+
+	for id := int64(1); id <= rows; id++ {
+		if !seen[id] {
+			t.Fatalf("row %d was never re-delivered", id)
+		}
+	}
+	if position := hooks2.awaitCompletion(t); position == "" {
+		t.Error("completion did not report the position streaming starts from")
+	}
+	if _, completed, _ := hooks2.state(); completed != 1 {
+		t.Errorf("snapshot completion recorded %d times, want 1", completed)
 	}
 }

@@ -25,6 +25,7 @@ Instead the guarantees are a handful of invariants that can each be tested:
 | **Replays cannot corrupt** | Every event carries a `position`; sinks either upsert on the primary key or dedupe on `(source_id, table, position)`. |
 | **Nothing is dropped** | Failed writes retry with capped backoff, forever. A broken sink stalls loudly instead of losing data quietly. |
 | **A stale leader cannot rewind progress** | Offset and cursor writes are fenced on still holding the lease; a zombie leader gets `ErrLeaseLost` and stops. |
+| **An interrupted snapshot is never mistaken for a complete one** | `snapshot_state` records the snapshot phase; an offset written mid-snapshot is discarded and the snapshot is taken again. |
 | **The source only releases logs we truly have** | The position acknowledged back to the source is the *slowest* sink's, never the read-ahead position. |
 
 ## Architecture
@@ -108,6 +109,23 @@ UPDATE leases
 `lease_renew`; failover takes at most `lease_ttl`. On a clean stop the holder
 expires its own lease so the standby starts immediately.
 
+**Interrupted snapshots.** Sinks accept snapshot rows as they arrive, so the
+pipeline offset advances to the slot's consistent point while the initial
+snapshot is still running. An instance killed midway therefore leaves an offset
+that *looks* perfectly resumable but covers only the rows already read.
+Resuming from it would stream forward and never deliver the rest — a green
+pipeline, permanently missing data. So `snapshot_state` records the phase, and a
+run only trusts an offset once the snapshot is marked `done`; otherwise it drops
+the leftover slot and snapshots again. A redundant snapshot costs time, a
+skipped one costs data.
+
+One residual gap to know about: if a row is deleted at the source between an
+aborted snapshot and its replacement, the sink can keep a stale copy — the row
+is in neither the new snapshot nor the new stream. For an append-mostly table
+this is harmless; otherwise truncate the target before letting a re-bootstrap
+run. The proper fix is chunked snapshots with watermarks, which is on the
+roadmap, not in this version.
+
 **Failover replay.** After a crash the successor resumes from the stored
 offset, which is the slowest sink's committed position — so the last few events
 before the crash are delivered again. That is the at-least-once window, and it
@@ -132,6 +150,9 @@ never blanked by an update that did not touch it.
   write, because a keyless upsert duplicates rows on every replay.
 - **Renaming `pipeline.id` or `source.id`** starts a new slot and a new dedupe
   key space: everything is re-delivered.
+- **A pipeline that logs `bootstrapping from scratch`** is re-reading the whole
+  source because its last snapshot never finished. Expect the initial load
+  again; check `snapshot_state` for when it started and completed.
 
 ## Status
 
@@ -140,6 +161,7 @@ never blanked by an update that did not touch it.
 | Control plane: offsets, leases, per-sink cursors, lease fencing | done, integration-tested |
 | Leader/standby runner with heartbeat and handover | done, failover-tested |
 | Postgres reader: consistent snapshot + logical streaming + WAL ack | done, integration-tested |
+| Snapshot crash safety (`snapshot_state`, forced re-bootstrap) | done, regression-tested |
 | Sink router: independent queues, cursors, retry, slowest-sink offset | done, unit-tested |
 | Sinks: webhook, pgupsert, stdout | done |
 | MySQL reader (binlog + GTID) | interface in place, reader pending |
@@ -173,12 +195,21 @@ guarantees against a real server:
   across the snapshot/stream boundary; plus resume-from-offset and
   update/delete images.
 
-End-to-end failover, including a mid-stream `SIGKILL` of the leader and a
-row-for-row comparison of source and mirror afterwards:
+Two end-to-end checks run the real binary across a process kill:
 
 ```bash
+# Leader SIGKILLed mid-stream: the standby takes over and the mirror ends up
+# matching the source row for row.
 CP_DSN=... SRC_DSN=... MIRROR_DSN=... scripts/verify-failover.sh
+
+# Leader SIGKILLed mid-snapshot with a committed offset in place: the restart
+# must re-snapshot and recover every row rather than streaming on from the
+# partial offset.
+CP_DSN=... SRC_DSN=... MIRROR_DSN=... scripts/verify-snapshot-crash.sh
 ```
+
+CI (`.github/workflows/ci.yaml`) runs gofmt, vet, the unit tests, then the
+integration tests and both scripts against a real PostgreSQL 16.
 
 ## Layout
 
