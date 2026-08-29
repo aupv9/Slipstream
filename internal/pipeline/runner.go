@@ -12,6 +12,7 @@ import (
 	"github.com/aupv9/slipstream/internal/cdc"
 	"github.com/aupv9/slipstream/internal/config"
 	"github.com/aupv9/slipstream/internal/controlplane"
+	"github.com/aupv9/slipstream/internal/observability"
 	"github.com/aupv9/slipstream/internal/sink"
 	"github.com/aupv9/slipstream/internal/source"
 )
@@ -24,18 +25,41 @@ const eventBuffer = 1024
 // holds it, runs the source reader and the sink fan-out. Run two or more of
 // these against the same control plane and the pipeline is highly available.
 type Runner struct {
-	cfg   *config.Config
-	store *controlplane.Store
-	log   *slog.Logger
+	cfg     *config.Config
+	store   *controlplane.Store
+	metrics *observability.Registry
+	health  *observability.Health
+	log     *slog.Logger
 }
 
-// NewRunner builds a runner.
-func NewRunner(cfg *config.Config, store *controlplane.Store, log *slog.Logger) *Runner {
-	return &Runner{
-		cfg:   cfg,
-		store: store,
-		log:   log.With("pipeline", cfg.Pipeline.ID, "instance", cfg.InstanceID),
+// NewRunner builds a runner. metrics and health may be nil when the endpoints
+// are disabled.
+func NewRunner(cfg *config.Config, store *controlplane.Store, metrics *observability.Registry, health *observability.Health, log *slog.Logger) *Runner {
+	if health == nil {
+		health = &observability.Health{}
 	}
+	return &Runner{
+		cfg:     cfg,
+		store:   store,
+		metrics: metrics,
+		health:  health,
+		log:     log.With("pipeline", cfg.Pipeline.ID, "instance", cfg.InstanceID),
+	}
+}
+
+// pipelineLabels are the metric labels for this runner.
+func (r *Runner) pipelineLabels() []string {
+	return []string{"pipeline", r.cfg.Pipeline.ID, "instance", r.cfg.InstanceID}
+}
+
+// setRole publishes whether this instance is the leader.
+func (r *Runner) setRole(leader bool) {
+	r.health.Leader.Store(leader)
+	var v int64
+	if leader {
+		v = 1
+	}
+	r.metrics.Set(observability.MetricLeader, r.pipelineLabels(), v)
 }
 
 // Run blocks until ctx is cancelled, alternating between standby and leader.
@@ -61,6 +85,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 
 		if !leader {
+			r.setRole(false)
 			if !standby {
 				holder, _ := r.store.LeaseHolder(ctx, r.cfg.Pipeline.ID)
 				r.log.Info("standby: another instance holds the lease", "holder", holder)
@@ -73,11 +98,17 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 
 		standby = false
+		r.setRole(true)
 		r.log.Info("acquired lease; becoming leader")
-		if err := r.lead(ctx); err != nil {
+		err = r.lead(ctx)
+		r.setRole(false)
+		r.health.Streaming.Store(false)
+		r.health.SetError(err)
+		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
+			r.metrics.Add(observability.MetricPipelineRestarts, r.pipelineLabels(), 1)
 			r.log.Error("pipeline stopped", "err", err)
 		}
 		if ctx.Err() != nil {
@@ -209,16 +240,20 @@ type snapshotHooks struct {
 	pipelineID string
 	holder     string
 	capture    string
+	metrics    *observability.Registry
+	labels     []string
 	log        *slog.Logger
 }
 
 func (h *snapshotHooks) SnapshotStarted(ctx context.Context) error {
 	h.log.Info("snapshot starting", "capture", h.capture)
+	h.metrics.Set(observability.MetricSnapshotRunning, h.labels, 1)
 	return h.store.BeginSnapshot(ctx, h.pipelineID, h.holder, h.capture)
 }
 
 func (h *snapshotHooks) SnapshotCompleted(ctx context.Context, position string) error {
 	h.log.Info("snapshot complete", "position", position)
+	h.metrics.Set(observability.MetricSnapshotRunning, h.labels, 0)
 	return h.store.CompleteSnapshot(ctx, h.pipelineID, h.holder, position)
 }
 
@@ -278,8 +313,23 @@ func (r *Runner) runPipeline(ctx context.Context) error {
 		acker = a
 	}
 
-	router := NewRouter(r.cfg.Pipeline.ID, r.cfg.InstanceID, r.store,
-		r.cfg.Pipeline.Sinks, sinks, r.cfg.Pipeline.CommitInterval.D(), acker, r.log)
+	var lag source.LagReporter
+	if l, ok := reader.(source.LagReporter); ok {
+		lag = l
+	}
+
+	router := NewRouter(RouterOptions{
+		PipelineID: r.cfg.Pipeline.ID,
+		Holder:     r.cfg.InstanceID,
+		Store:      r.store,
+		SinkConfig: r.cfg.Pipeline.Sinks,
+		Sinks:      sinks,
+		Interval:   r.cfg.Pipeline.CommitInterval.D(),
+		Acker:      acker,
+		Lag:        lag,
+		Metrics:    r.metrics,
+		Log:        r.log,
+	})
 
 	req := source.ReadRequest{
 		From:           plan.From,
@@ -289,6 +339,8 @@ func (r *Runner) runPipeline(ctx context.Context) error {
 			pipelineID: r.cfg.Pipeline.ID,
 			holder:     r.cfg.InstanceID,
 			capture:    captureID(r.cfg.Pipeline.Source),
+			metrics:    r.metrics,
+			labels:     []string{"pipeline", r.cfg.Pipeline.ID},
 			log:        r.log,
 		},
 	}
@@ -297,6 +349,8 @@ func (r *Runner) runPipeline(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		defer close(events)
+		defer r.health.Streaming.Store(false)
+		r.health.Streaming.Store(true)
 		rerr := reader.ReadChanges(gctx, req, events)
 		if rerr != nil && !errors.Is(rerr, context.Canceled) {
 			return rerr

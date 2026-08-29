@@ -7,7 +7,7 @@ no Debezium.
 Sources: **PostgreSQL** (implemented), **MySQL** and **MongoDB** (interfaces in
 place, readers pending — see [Status](#status)).
 Sinks: generic through an in-process Go interface, with a webhook, a
-Postgres/warehouse upsert writer and stdout built in.
+Postgres/warehouse upsert writer, NATS, Kafka and stdout built in.
 
 ## What "correct" means here
 
@@ -148,6 +148,25 @@ the WAL record. Slipstream omits those keys from the event rather than sending
 `null`, and the upsert sink updates only the columns present, so a wide row is
 never blanked by an update that did not touch it.
 
+## Watching it run
+
+Set `observability.addr` and the process serves:
+
+| Endpoint | What it is for |
+|---|---|
+| `/metrics` | Prometheus text format, no client library and no extra dependency. |
+| `/healthz` | Liveness. Always 200 while the process is up. |
+| `/readyz` | Readiness, plus the instance's role. A standby answers 200: it is *meant* to be idle, and taking it out of service would defeat the point of running one. |
+
+The metric worth alerting on is `slipstream_source_lag_bytes`: how much log the
+source is still holding because the slowest sink has not accepted it yet. It
+comes from the server's own reported position versus what has been
+acknowledged, so it costs no extra query. Also worth watching:
+`slipstream_dead_lettered_total` (anything above zero means events were parked
+rather than delivered), `slipstream_leader` (two instances reporting 1 for one
+pipeline would mean split brain), and `slipstream_sink_queue_depth` (which sink
+is applying the backpressure).
+
 ## Operating notes
 
 - **A replication slot pins WAL.** If a pipeline stops for good, drop its slot
@@ -181,7 +200,8 @@ never blanked by an update that did not touch it.
 | Postgres reader: consistent snapshot + logical streaming + WAL ack | done, integration-tested |
 | Snapshot crash safety (`snapshot_state`, forced re-bootstrap) | done, regression-tested |
 | Sink router: independent queues, cursors, retry, slowest-sink offset | done, unit-tested |
-| Sinks: webhook, pgupsert, stdout | done |
+| Sinks: webhook, pgupsert, NATS, Kafka, stdout | done; all but Kafka integration-tested against a real server |
+| Metrics, health and readiness endpoints | done, tested |
 | TRUNCATE propagation | done, integration-tested |
 | Publication reconcile (refuse silent table drift) | done, integration-tested |
 | Dead-letter queue with per-event isolation | done, unit-tested |

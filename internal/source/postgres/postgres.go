@@ -40,6 +40,10 @@ type Reader struct {
 
 	// ackLSN is written by the pipeline (Ack) and read by the streaming loop.
 	ackLSN atomic.Uint64
+	// serverLSN is the furthest position the server has told us about, from
+	// keepalives and data messages. The gap to ackLSN is the WAL the server is
+	// still holding for us.
+	serverLSN atomic.Uint64
 }
 
 // New builds a Postgres reader. Nothing is connected until ReadChanges runs.
@@ -70,6 +74,32 @@ func (r *Reader) Ack(position string) {
 			return
 		}
 		if r.ackLSN.CompareAndSwap(cur, uint64(lsn)) {
+			return
+		}
+	}
+}
+
+// LagBytes reports how much WAL the server is still retaining for this slot.
+func (r *Reader) LagBytes() (int64, bool) {
+	server := r.serverLSN.Load()
+	acked := r.ackLSN.Load()
+	if server == 0 || acked == 0 {
+		return 0, false
+	}
+	if server < acked {
+		return 0, true
+	}
+	return int64(server - acked), true
+}
+
+// noteServerPosition records the furthest position the server has reported.
+func (r *Reader) noteServerPosition(lsn pglogrepl.LSN) {
+	for {
+		cur := r.serverLSN.Load()
+		if uint64(lsn) <= cur {
+			return
+		}
+		if r.serverLSN.CompareAndSwap(cur, uint64(lsn)) {
 			return
 		}
 	}
@@ -409,6 +439,7 @@ func (r *Reader) stream(ctx context.Context, startLSN pglogrepl.LSN, out chan<- 
 			if err != nil {
 				return fmt.Errorf("postgres: parse keepalive: %w", err)
 			}
+			r.noteServerPosition(ka.ServerWALEnd)
 			if ka.ReplyRequested {
 				if err := r.sendStandbyUpdate(ctx); err != nil {
 					return err
@@ -421,6 +452,7 @@ func (r *Reader) stream(ctx context.Context, startLSN pglogrepl.LSN, out chan<- 
 			if err != nil {
 				return fmt.Errorf("postgres: parse xlogdata: %w", err)
 			}
+			r.noteServerPosition(xld.ServerWALEnd)
 			msg, err := pglogrepl.Parse(xld.WALData)
 			if err != nil {
 				// Unknown message types (logical decoding messages, stream

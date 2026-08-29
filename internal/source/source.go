@@ -73,6 +73,15 @@ type Acker interface {
 	Ack(position string)
 }
 
+// LagReporter is implemented by readers that can say how far the source has
+// moved beyond what we have acknowledged. This is the number worth alerting on:
+// it is what the source must still retain for us.
+type LagReporter interface {
+	// LagBytes reports the backlog in bytes. ok is false before the reader has
+	// heard enough from the server to know.
+	LagBytes() (bytes int64, ok bool)
+}
+
 // ErrNotImplemented is returned by readers that are declared but not yet
 // built.
 type ErrNotImplemented struct {
