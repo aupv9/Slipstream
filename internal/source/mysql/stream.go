@@ -50,6 +50,11 @@ func (r *Reader) stream(ctx context.Context, db *sql.DB, startSet string, out ch
 	})
 	defer r.Close()
 
+	// The syncer takes ownership of the set it is given and mutates it from its
+	// own goroutine as it advances. Our copy has to be made before handing it
+	// over, or reading ours races with the syncer writing theirs.
+	committed := gset.Clone()
+
 	streamer, err := r.syncer.StartSyncGTID(gset)
 	if err != nil {
 		return fmt.Errorf("mysql: start replication at %s: %w", startSet, err)
@@ -58,7 +63,6 @@ func (r *Reader) stream(ctx context.Context, db *sql.DB, startSet string, out ch
 
 	// committed is the position events are stamped with: everything durably
 	// before the transaction currently being decoded.
-	committed := gset.Clone()
 	var pendingGTID string
 
 	for {
