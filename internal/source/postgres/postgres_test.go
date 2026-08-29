@@ -785,9 +785,9 @@ func TestIdleCaptureStillAdvancesTheAcknowledgedPosition(t *testing.T) {
 		}
 	}
 
-	// The reader learns the server's position from keepalives, so give it a
-	// moment to see one.
-	deadline := time.Now().Add(30 * time.Second)
+	// The reader learns the server's position from keepalives, and an idle
+	// walsender only sends one every wal_sender_timeout/2 — 30s by default.
+	deadline := time.Now().Add(90 * time.Second)
 	for {
 		lag, ok := reader.LagBytes()
 		if ok && lag == 0 {
