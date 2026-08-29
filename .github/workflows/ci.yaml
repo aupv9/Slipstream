@@ -56,13 +56,16 @@ jobs:
             -c wal_level=logical \
             -c max_replication_slots=10 \
             -c max_wal_senders=10
-          for _ in $(seq 1 60); do
-            docker exec pg pg_isready -U postgres -q && break
+          # Wait over TCP, not the unix socket: during initialisation the
+          # entrypoint runs a temporary server on the socket only, so a socket
+          # check reports ready and the next command then races its shutdown.
+          for _ in $(seq 1 90); do
+            if docker exec pg pg_isready -h 127.0.0.1 -U postgres -q; then break; fi
             sleep 1
           done
-          docker exec pg pg_isready -U postgres
+          docker exec pg psql -h 127.0.0.1 -U postgres -c 'SELECT 1' >/dev/null
           for db in app mirror slipstream_cp; do
-            docker exec pg createdb -U postgres "$db"
+            docker exec pg createdb -h 127.0.0.1 -U postgres "$db"
           done
 
       # MySQL needs ROW binlog and GTID mode, which a service container cannot
@@ -75,11 +78,14 @@ jobs:
             mysql:8 \
             --server-id=1 --log-bin=binlog --binlog-format=ROW \
             --binlog-row-image=FULL --gtid-mode=ON --enforce-gtid-consistency=ON
+          # Same reasoning as Postgres: the entrypoint's temporary server is
+          # reachable over the socket long before the real one accepts TCP.
           for _ in $(seq 1 90); do
-            docker exec my mysqladmin ping -h 127.0.0.1 --silent 2>/dev/null && break
+            if docker exec my mysql -h 127.0.0.1 -e 'SELECT 1' >/dev/null 2>&1; then break; fi
             sleep 2
           done
-          docker exec my mysql -e "CREATE USER IF NOT EXISTS 'slip'@'%' IDENTIFIED BY 'slip';
+          docker exec my mysql -h 127.0.0.1 -e 'SELECT 1' >/dev/null
+          docker exec my mysql -h 127.0.0.1 -e "CREATE USER IF NOT EXISTS 'slip'@'%' IDENTIFIED BY 'slip';
                                    GRANT ALL ON *.* TO 'slip'@'%'; FLUSH PRIVILEGES;"
 
       # Change streams need a replica set; a standalone mongod has none.
@@ -88,14 +94,16 @@ jobs:
           docker run -d --name mongo -p 27017:27017 mongo:7 \
             --replSet rs0 --bind_ip_all
           for _ in $(seq 1 60); do
-            docker exec mongo mongosh --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+            if docker exec mongo mongosh --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then break; fi
             sleep 2
           done
           docker exec mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]})'
+          # A replica set is only usable once a primary has been elected.
           for _ in $(seq 1 60); do
-            docker exec mongo mongosh --quiet --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true && break
+            if docker exec mongo mongosh --quiet --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true; then break; fi
             sleep 2
           done
+          docker exec mongo mongosh --quiet --eval 'db.hello().isWritablePrimary' | grep -q true
 
       - name: install psql
         run: command -v psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
@@ -107,7 +115,7 @@ jobs:
           go install github.com/nats-io/nats-server/v2@latest
           "$(go env GOPATH)/bin/nats-server" -js -p 4222 -sd /tmp/natsdata >/tmp/nats.log 2>&1 &
           for _ in $(seq 1 30); do
-            (echo > /dev/tcp/127.0.0.1/4222) >/dev/null 2>&1 && break
+            if (echo > /dev/tcp/127.0.0.1/4222) >/dev/null 2>&1; then break; fi
             sleep 1
           done
 
