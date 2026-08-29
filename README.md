@@ -294,6 +294,17 @@ CP_DSN=... SRC_DSN=... MIRROR_DSN=... scripts/verify-snapshot-crash.sh
 CI (`.github/workflows/ci.yaml`) runs gofmt, vet, the unit tests, then the
 integration tests and both scripts against a real PostgreSQL 16.
 
+## Regenerating the Protobuf types
+
+The generated code is committed, so building and testing need no extra tools.
+To change the schema, edit `internal/encoding/eventpb/event.proto` and run
+`make proto`, which needs:
+
+```bash
+go install github.com/bufbuild/buf/cmd/buf@latest
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+```
+
 ## Layout
 
 ```
