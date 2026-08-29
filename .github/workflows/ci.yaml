@@ -127,7 +127,21 @@ jobs:
           SLIPSTREAM_TEST_NATS_URL: nats://127.0.0.1:4222
           SLIPSTREAM_TEST_MYSQL_DSN: slip:slip@tcp(127.0.0.1:3306)/app
           SLIPSTREAM_TEST_MONGO_URI: mongodb://127.0.0.1:27017/?replicaSet=rs0
-        run: go test ./... -count=1 -race
+        # Keep the output so a failure can be summarised on its own, instead of
+        # being buried under the server logs printed afterwards.
+        run: |
+          set -o pipefail
+          go test ./... -count=1 -race 2>&1 | tee /tmp/test.log
+
+      - name: failing tests
+        if: failure()
+        run: |
+          echo "::group::failures"
+          grep -E "^(--- FAIL|FAIL|ok|panic:)" /tmp/test.log || true
+          echo "::endgroup::"
+          echo "::group::detail"
+          grep -B2 -A25 -E "^--- FAIL" /tmp/test.log | head -200 || true
+          echo "::endgroup::"
 
       # The guarantees that only show up across a process boundary: a leader
       # killed mid-stream, and a leader killed mid-snapshot.
@@ -148,7 +162,7 @@ jobs:
       - name: server logs on failure
         if: failure()
         run: |
-          docker logs pg 2>&1 | tail -40
-          docker logs my 2>&1 | tail -40
-          docker logs mongo 2>&1 | tail -40
-          tail -40 /tmp/nats.log || true
+          docker logs pg 2>&1 | tail -15
+          docker logs my 2>&1 | tail -10
+          docker logs mongo 2>&1 | tail -10
+          tail -10 /tmp/nats.log || true
