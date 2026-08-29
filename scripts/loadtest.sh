@@ -97,7 +97,7 @@ START=$(date +%s.%N)
 PIDS=$!
 
 for _ in $(seq 1 3000); do
-  curl -sf "http://127.0.0.1:${METRICS_PORT}/healthz" >/dev/null 2>&1 && break
+  if curl -sf "http://127.0.0.1:${METRICS_PORT}/healthz" >/dev/null 2>&1; then break; fi
   sleep 0.1
 done
 
