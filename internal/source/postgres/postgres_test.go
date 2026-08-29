@@ -431,13 +431,34 @@ type recordingHooks struct {
 	started   int
 	completed int
 	position  string
+	mode      string
+	chunks    []chunkProgress
 }
 
-func (h *recordingHooks) SnapshotStarted(context.Context) error {
+func (h *recordingHooks) SnapshotStarted(_ context.Context, mode string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.started++
+	h.mode = mode
 	return nil
+}
+
+func (h *recordingHooks) SnapshotChunkDone(_ context.Context, table string, key []byte) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.chunks = append(h.chunks, chunkProgress{table: table, key: string(key)})
+	return nil
+}
+
+func (h *recordingHooks) progress() []chunkProgress {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]chunkProgress(nil), h.chunks...)
+}
+
+type chunkProgress struct {
+	table string
+	key   string
 }
 
 func (h *recordingHooks) SnapshotCompleted(_ context.Context, position string) error {
@@ -446,6 +467,13 @@ func (h *recordingHooks) SnapshotCompleted(_ context.Context, position string) e
 	h.completed++
 	h.position = position
 	return nil
+}
+
+// state3 also reports the recorded snapshot mode.
+func (h *recordingHooks) state3() (started, completed int, mode string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.started, h.completed, h.mode
 }
 
 func (h *recordingHooks) state() (started, completed int, position string) {
@@ -713,5 +741,62 @@ func waitForStreaming(t *testing.T, f *fixture, ctx context.Context) {
 			t.Fatalf("the reader never started streaming (last err: %v)", err)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// A slot pins WAL until the position is acknowledged. If that only moved when
+// one of our own events was committed, a quiet captured table on a busy
+// database would hold WAL forever and fill the disk. Once everything emitted
+// has been acknowledged, keepalives must carry the position forward.
+func TestIdleCaptureStillAdvancesTheAcknowledgedPosition(t *testing.T) {
+	f := newFixture(t, "idlelag")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// A second table, outside the publication, stands in for the rest of a
+	// busy database.
+	noise := f.table + "_noise"
+	if _, err := f.conn.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s (id bigint, note text)`, noise)); err != nil {
+		t.Fatalf("create noise table: %v", err)
+	}
+	t.Cleanup(func() { _, _ = f.conn.Exec(context.Background(), "DROP TABLE IF EXISTS "+noise) })
+
+	if _, err := f.conn.Exec(ctx, fmt.Sprintf(`INSERT INTO %s VALUES (1, 'seed')`, f.table)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	reader := New(f.readerConfig(), "src", quietLogger())
+	events := make(chan cdc.ChangeEvent, 128)
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	go func() {
+		defer close(events)
+		_ = reader.ReadChanges(runCtx, source.ReadRequest{}, events)
+	}()
+
+	snap := waitFor(t, events, func(ev cdc.ChangeEvent) bool { return ev.Op == cdc.OpRead })
+	reader.Ack(snap.Position)
+
+	// Generate WAL that produces no events for this pipeline.
+	for range 200 {
+		if _, err := f.conn.Exec(ctx, fmt.Sprintf(
+			`INSERT INTO %s SELECT g, repeat('x', 200) FROM generate_series(1, 50) g`, noise)); err != nil {
+			t.Fatalf("noise: %v", err)
+		}
+	}
+
+	// The reader learns the server's position from keepalives, so give it a
+	// moment to see one.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		lag, ok := reader.LagBytes()
+		if ok && lag == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lag stayed at %d bytes with nothing of ours outstanding; "+
+				"the slot would pin WAL indefinitely", lag)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }

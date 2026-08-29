@@ -6,10 +6,12 @@ import (
 	"log/slog"
 
 	"github.com/aupv9/slipstream/internal/config"
+	"github.com/aupv9/slipstream/internal/encoding"
 	"github.com/aupv9/slipstream/internal/sink"
 	"github.com/aupv9/slipstream/internal/sink/kafkasink"
 	"github.com/aupv9/slipstream/internal/sink/natssink"
 	"github.com/aupv9/slipstream/internal/sink/pgupsert"
+	"github.com/aupv9/slipstream/internal/sink/processsink"
 	"github.com/aupv9/slipstream/internal/sink/stdout"
 	"github.com/aupv9/slipstream/internal/sink/webhook"
 	"github.com/aupv9/slipstream/internal/source"
@@ -34,7 +36,7 @@ func buildReader(cfg config.Source, log *slog.Logger) (source.Reader, error) {
 
 // buildSinks constructs every configured sink. On error, sinks already built
 // are closed so a bad config leaves no connections behind.
-func buildSinks(ctx context.Context, cfgs []config.SinkConfig) ([]sink.Sink, error) {
+func buildSinks(ctx context.Context, cfgs []config.SinkConfig, log *slog.Logger) ([]sink.Sink, error) {
 	built := make([]sink.Sink, 0, len(cfgs))
 	fail := func(err error) ([]sink.Sink, error) {
 		for _, s := range built {
@@ -60,20 +62,26 @@ func buildSinks(ctx context.Context, cfgs []config.SinkConfig) ([]sink.Sink, err
 			}
 			built = append(built, s)
 		case "nats":
-			s, err := natssink.New(c.Name, c.NATS)
+			s, err := natssink.New(c.Name, c.NATS, encoding.Format(c.Encoding))
 			if err != nil {
 				return fail(err)
 			}
 			built = append(built, s)
 		case "kafka":
-			s, err := kafkasink.New(c.Name, c.Kafka)
+			s, err := kafkasink.New(c.Name, c.Kafka, encoding.Format(c.Encoding))
+			if err != nil {
+				return fail(err)
+			}
+			built = append(built, s)
+		case "process":
+			s, err := processsink.New(c.Name, c.Process, log)
 			if err != nil {
 				return fail(err)
 			}
 			built = append(built, s)
 		default:
 			return fail(fmt.Errorf("pipeline: unknown sink type %q for sink %q "+
-				"(want stdout, webhook, pgupsert, nats or kafka)", c.Type, c.Name))
+				"(want stdout, webhook, pgupsert, nats, kafka or process)", c.Type, c.Name))
 		}
 	}
 	return built, nil

@@ -154,3 +154,105 @@ func TestLoadRejectsLeaseRenewAtOrAboveTTL(t *testing.T) {
 		t.Fatalf("expected a lease_renew/lease_ttl error, got %v", err)
 	}
 }
+
+const twoPipelines = `
+control_plane:
+  dsn: postgres://cp/slipstream
+pipelines:
+  - id: orders
+    source:
+      type: postgres
+      postgres:
+        dsn: postgres://src/orders
+        tables: [public.orders]
+    sinks:
+      - name: hook
+        type: webhook
+        webhook:
+          url: https://example.test/orders
+  - id: customers
+    source:
+      type: postgres
+      postgres:
+        dsn: postgres://src/customers
+        tables: [public.customers]
+    sinks:
+      - name: bus
+        type: nats
+        encoding: protobuf
+        nats:
+          url: nats://localhost:4222
+`
+
+func TestLoadSeveralPipelines(t *testing.T) {
+	cfg, err := Load(write(t, twoPipelines))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	all := cfg.AllPipelines()
+	if len(all) != 2 {
+		t.Fatalf("got %d pipelines, want 2", len(all))
+	}
+
+	// Each pipeline needs its own slot and publication, or two pipelines would
+	// fight over one replication slot.
+	if all[0].Source.Postgres.Slot == all[1].Source.Postgres.Slot {
+		t.Errorf("both pipelines default to slot %q", all[0].Source.Postgres.Slot)
+	}
+	if all[0].Source.Postgres.Slot != "slipstream_orders" {
+		t.Errorf("slot = %q", all[0].Source.Postgres.Slot)
+	}
+	if all[1].Sinks[0].Encoding != "protobuf" {
+		t.Errorf("encoding = %q", all[1].Sinks[0].Encoding)
+	}
+	if all[0].Sinks[0].QueueSize == 0 || all[1].Sinks[0].QueueSize == 0 {
+		t.Error("sink defaults were not applied to every pipeline")
+	}
+}
+
+func TestSinglePipelineStillWorksAndIsListed(t *testing.T) {
+	cfg, err := Load(write(t, minimal))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	all := cfg.AllPipelines()
+	if len(all) != 1 || all[0].ID != "pg-main" {
+		t.Fatalf("AllPipelines() = %+v", all)
+	}
+	if cfg.Pipeline.ID != "pg-main" {
+		t.Error("the single-pipeline field should still be populated")
+	}
+}
+
+func TestRejectsBothPipelineForms(t *testing.T) {
+	body := minimal + `
+pipelines:
+  - id: other
+    source:
+      type: postgres
+    sinks:
+      - name: s
+        type: stdout
+`
+	_, err := Load(write(t, body))
+	if err == nil || !strings.Contains(err.Error(), "not both") {
+		t.Fatalf("expected a clear error about using both forms, got %v", err)
+	}
+}
+
+func TestRejectsDuplicatePipelineIDs(t *testing.T) {
+	body := strings.Replace(twoPipelines, "- id: customers", "- id: orders", 1)
+	_, err := Load(write(t, body))
+	if err == nil || !strings.Contains(err.Error(), "duplicate pipeline id") {
+		t.Fatalf("expected a duplicate id error, got %v", err)
+	}
+}
+
+func TestRejectsEncodingOnSinksThatHaveTheirOwnFormat(t *testing.T) {
+	body := strings.Replace(minimal, "      type: webhook", "      type: webhook\n      encoding: protobuf", 1)
+	_, err := Load(write(t, body))
+	if err == nil || !strings.Contains(err.Error(), "takes no encoding") {
+		t.Fatalf("expected an encoding error, got %v", err)
+	}
+}

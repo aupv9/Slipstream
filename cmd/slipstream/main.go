@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -133,17 +134,38 @@ func cmdRun(args []string) error {
 		log.Info("metrics and health endpoints are disabled; set observability.addr to enable them")
 	}
 
+	pipelines := cfg.AllPipelines()
 	log.Info("starting",
 		"version", version,
-		"pipeline", cfg.Pipeline.ID,
 		"instance", cfg.InstanceID,
-		"source", cfg.Pipeline.Source.Type,
-		"sinks", sinkNames(cfg),
+		"pipelines", len(pipelines),
 		"lease_ttl", cfg.ControlPlane.LeaseTTL.D())
+	for _, p := range pipelines {
+		log.Info("pipeline configured", "pipeline", p.ID, "source", p.Source.Type, "sinks", sinkNames(p))
+	}
 
-	err = pipeline.NewRunner(cfg, store, metrics, health, log).Run(ctx)
+	// Each pipeline competes for its own lease, so one process can lead some
+	// and stand by for others. A failure in one must not take the rest down.
+	var wg sync.WaitGroup
+	errs := make(chan error, len(pipelines))
+	for _, p := range pipelines {
+		wg.Add(1)
+		go func(p config.Pipeline) {
+			defer wg.Done()
+			runner := pipeline.NewRunner(cfg.InstanceID, cfg.ControlPlane, p, store, metrics, health, log)
+			if err := runner.Run(ctx); err != nil {
+				errs <- fmt.Errorf("pipeline %s: %w", p.ID, err)
+			}
+		}(p)
+	}
+	wg.Wait()
+	close(errs)
+
 	log.Info("stopped")
-	return err
+	for err := range errs {
+		return err
+	}
+	return nil
 }
 
 func cmdMigrate(args []string) error {
@@ -189,9 +211,9 @@ func newLogger(level, format string) (*slog.Logger, error) {
 	}
 }
 
-func sinkNames(cfg *config.Config) string {
-	names := make([]string, 0, len(cfg.Pipeline.Sinks))
-	for _, s := range cfg.Pipeline.Sinks {
+func sinkNames(p config.Pipeline) string {
+	names := make([]string, 0, len(p.Sinks))
+	for _, s := range p.Sinks {
 		names = append(names, s.Name+"("+s.Type+")")
 	}
 	return strings.Join(names, ",")

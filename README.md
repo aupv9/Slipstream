@@ -6,7 +6,8 @@ no Debezium.
 
 Sources: **PostgreSQL**, **MySQL** and **MongoDB**.
 Sinks: generic through an in-process Go interface, with a webhook, a
-Postgres/warehouse upsert writer, NATS, Kafka and stdout built in.
+Postgres/warehouse upsert writer, NATS, Kafka and stdout built in — plus a
+`process` sink that hands batches to a program in any language.
 
 ## What "correct" means here
 
@@ -126,6 +127,26 @@ UPDATE leases
 `lease_renew`; failover takes at most `lease_ttl`. On a clean stop the holder
 expires its own lease so the standby starts immediately.
 
+**Chunked snapshots.** `snapshot_mode: chunked` reads a table in primary-key
+ranges *alongside* the stream instead of inside one long transaction. Before
+each chunk it writes a low watermark into the WAL, reads the chunk, then writes
+a high watermark; any row changed between those two marks arrives on the stream
+anyway, so it is dropped from the chunk and the stream's newer version wins.
+That is the scheme from the DBLog paper, except that Postgres can emit the
+watermarks itself with `pg_logical_emit_message`, so unlike the usual
+implementations this needs no signal table in your database.
+
+Two things follow. There is no long-running transaction, so a table too large to
+read in one pass is no longer a problem. And progress is recorded per chunk, so
+an interrupted snapshot continues from its last chunk rather than starting over
+— which also closes the stale-row gap the single-transaction mode has. The
+watermarks are transactional, because a non-transactional message is written but
+not flushed: measured here at 201ms per watermark against 0.6ms, and every chunk
+needs two.
+
+Chunked mode needs PostgreSQL 14 or newer and a primary key on every captured
+table; without one it refuses to start rather than skip the table.
+
 **Interrupted snapshots.** Sinks accept snapshot rows as they arrive, so the
 pipeline offset advances to the slot's consistent point while the initial
 snapshot is still running. An instance killed midway therefore leaves an offset
@@ -173,6 +194,11 @@ Set `observability.addr` and the process serves:
 | `/healthz` | Liveness. Always 200 while the process is up. |
 | `/readyz` | Readiness, plus the instance's role. A standby answers 200: it is *meant* to be idle, and taking it out of service would defeat the point of running one. |
 
+A quiet captured table on a busy database used to pin WAL forever, because the
+acknowledged position only moved when one of *our* events was committed. Once
+everything emitted has been accepted, keepalives now carry the position forward,
+so the slot stops holding WAL that has nothing to do with us.
+
 The metric worth alerting on is `slipstream_source_lag_bytes`: how much log the
 source is still holding because the slowest sink has not accepted it yet. It
 comes from the server's own reported position versus what has been
@@ -214,6 +240,10 @@ is applying the backpressure).
 | Leader/standby runner with heartbeat and handover | done, failover-tested |
 | Postgres reader: consistent snapshot + logical streaming + WAL ack | done, integration-tested |
 | Snapshot crash safety (`snapshot_state`, forced re-bootstrap) | done, regression-tested |
+| Chunked snapshots with WAL watermarks, resumable per chunk | done, integration-tested |
+| Several pipelines in one process | done, tested |
+| JSON and Protobuf encodings | done, tested |
+| `process` sink for sinks in any language | done, tested |
 | Sink router: independent queues, cursors, retry, slowest-sink offset | done, unit-tested |
 | Sinks: webhook, pgupsert, NATS, Kafka, stdout | done; all but Kafka integration-tested against a real server |
 | Metrics, health and readiness endpoints | done, tested |
@@ -223,12 +253,9 @@ is applying the backpressure).
 | MySQL reader (binlog + GTID, snapshot, DDL-aware schema cache) | done, integration-tested |
 | MongoDB reader (change stream, snapshot, resume tokens) | done; mapping unit-tested locally, server tests run in CI |
 
-Deliberately **not** built: exactly-once/2PC, parallel chunked snapshots for
-very large tables (a single-transaction snapshot is enough well past most
-workloads; revisit at tens of GB), out-of-process/multi-language sink plugins
-(a stdio-JSON sink mode can be added if another language is ever needed), a
-schema registry or Avro (JSON is easier to debug; Protobuf later if bandwidth
-matters), and Oracle/SQL Server/Db2.
+Deliberately **not** built: exactly-once end to end (it needs a transactional
+sink or two-phase commit, and that complexity is the opposite of the point), a
+schema registry or Avro, and Oracle/SQL Server/Db2.
 
 ## Tests
 
@@ -276,7 +303,10 @@ internal/config         YAML config, defaults, validation
 internal/controlplane   offsets, leases, sink cursors, schema
 internal/pipeline       leader/standby runner, sink router, factories
 internal/source         Reader interface + postgres, mysql, mongo
-internal/sink           Sink interface + webhook, pgupsert, stdout
+internal/encoding       JSON and Protobuf wire formats
+internal/observability  metrics registry, /metrics, /healthz, /readyz
+internal/sink           Sink interface + webhook, pgupsert, nats, kafka,
+                        process, stdout
 deploy/                 docker compose stack, systemd unit
 scripts/                failover verification
 ```

@@ -53,16 +53,33 @@ type ReadRequest struct {
 	// SnapshotStarted before emitting the first snapshot event and
 	// SnapshotCompleted only once every table has been read.
 	Hooks SnapshotHooks
+
+	// ResumeSnapshot continues an interrupted chunked snapshot instead of
+	// restarting it. Only chunked snapshots can be resumed: they stream from
+	// the beginning, so the stored offset stays meaningful throughout.
+	ResumeSnapshot *SnapshotResume
+}
+
+// SnapshotResume says which table a chunked snapshot had reached and the last
+// key it had read.
+type SnapshotResume struct {
+	Table string
+	Key   []byte
 }
 
 // SnapshotHooks records snapshot progress durably enough to survive the death
 // of the instance taking the snapshot.
 type SnapshotHooks interface {
-	// SnapshotStarted is called before the first snapshot row is emitted.
-	SnapshotStarted(ctx context.Context) error
+	// SnapshotStarted is called before the first snapshot row is emitted. The
+	// mode is recorded because it decides whether an interrupted snapshot can
+	// be resumed.
+	SnapshotStarted(ctx context.Context, mode string) error
 	// SnapshotCompleted is called after the last snapshot row is emitted,
 	// with the position where streaming begins.
 	SnapshotCompleted(ctx context.Context, position string) error
+	// SnapshotChunkDone records that a chunked snapshot has read a table up to
+	// key. Readers taking a single-transaction snapshot never call it.
+	SnapshotChunkDone(ctx context.Context, table string, key []byte) error
 }
 
 // Acker is implemented by readers that must tell the server how far we have

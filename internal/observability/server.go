@@ -7,33 +7,67 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"sync/atomic"
+	"sort"
+	"sync"
 	"time"
 )
 
-// Health is what the readiness endpoint reports.
+// Health is what the readiness endpoint reports. One process can run several
+// pipelines and be the leader for some and a standby for others, so state is
+// kept per pipeline.
 type Health struct {
-	// Leader is true on the instance currently holding the lease.
-	Leader atomic.Bool
-	// Streaming is true once the reader is attached and delivering.
-	Streaming atomic.Bool
-	// LastError holds the most recent pipeline failure, if any.
-	lastErr atomic.Value
+	mu        sync.Mutex
+	pipelines map[string]PipelineHealth
 }
 
-// SetError records the latest pipeline error for the status endpoint.
-func (h *Health) SetError(err error) {
-	if err == nil {
-		h.lastErr.Store("")
-		return
+// PipelineHealth is one pipeline's state.
+type PipelineHealth struct {
+	Leader    bool
+	Streaming bool
+	LastError string
+}
+
+// SetRole records whether this instance leads a pipeline.
+func (h *Health) SetRole(pipeline string, leader bool) {
+	h.update(pipeline, func(p *PipelineHealth) { p.Leader = leader })
+}
+
+// SetStreaming records whether a pipeline's reader is attached.
+func (h *Health) SetStreaming(pipeline string, streaming bool) {
+	h.update(pipeline, func(p *PipelineHealth) { p.Streaming = streaming })
+}
+
+// SetError records the latest failure for a pipeline.
+func (h *Health) SetError(pipeline string, err error) {
+	h.update(pipeline, func(p *PipelineHealth) {
+		if err == nil {
+			p.LastError = ""
+			return
+		}
+		p.LastError = err.Error()
+	})
+}
+
+func (h *Health) update(pipeline string, mutate func(*PipelineHealth)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pipelines == nil {
+		h.pipelines = make(map[string]PipelineHealth)
 	}
-	h.lastErr.Store(err.Error())
+	p := h.pipelines[pipeline]
+	mutate(&p)
+	h.pipelines[pipeline] = p
 }
 
-// LastError returns the most recent pipeline error.
-func (h *Health) LastError() string {
-	v, _ := h.lastErr.Load().(string)
-	return v
+// Snapshot returns the current state of every pipeline.
+func (h *Health) Snapshot() map[string]PipelineHealth {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make(map[string]PipelineHealth, len(h.pipelines))
+	for k, v := range h.pipelines {
+		out[k] = v
+	}
+	return out
 }
 
 // Server exposes /metrics, /healthz and /readyz.
@@ -109,12 +143,24 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
-	role := "standby"
-	if s.health.Leader.Load() {
-		role = "leader"
-	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "ready\nrole: %s\nstreaming: %v\nlast_error: %s\n",
-		role, s.health.Streaming.Load(), s.health.LastError())
+	_, _ = w.Write([]byte("ready\n"))
+
+	state := s.health.Snapshot()
+	names := make([]string, 0, len(state))
+	for name := range state {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		p := state[name]
+		role := "standby"
+		if p.Leader {
+			role = "leader"
+		}
+		fmt.Fprintf(w, "pipeline: %s role: %s streaming: %v last_error: %s\n",
+			name, role, p.Streaming, p.LastError)
+	}
 }

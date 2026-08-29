@@ -39,9 +39,15 @@ type Config struct {
 	// InstanceID identifies this process in the leases table. Defaults to
 	// "<hostname>-<pid>", which is distinct enough to make split-brain
 	// visible in the table if it ever happened.
-	InstanceID    string        `yaml:"instance_id"`
-	ControlPlane  ControlPlane  `yaml:"control_plane"`
-	Pipeline      Pipeline      `yaml:"pipeline"`
+	InstanceID   string       `yaml:"instance_id"`
+	ControlPlane ControlPlane `yaml:"control_plane"`
+	// Pipeline configures a single pipeline. Use Pipelines instead to run
+	// several from one process; setting both is an error.
+	Pipeline Pipeline `yaml:"pipeline"`
+	// Pipelines runs more than one pipeline in the same process. Each keeps
+	// its own lease, offset and sinks, so they fail over independently — one
+	// process can be the leader for some and a standby for others.
+	Pipelines     []Pipeline    `yaml:"pipelines"`
 	Observability Observability `yaml:"observability"`
 }
 
@@ -107,6 +113,20 @@ type Postgres struct {
 	AutoAddTables bool `yaml:"auto_add_tables"`
 	// Snapshot takes an initial consistent snapshot when no offset exists.
 	Snapshot bool `yaml:"snapshot"`
+	// SnapshotMode is "single" (default) or "chunked".
+	//
+	// single reads every table inside one exported-snapshot transaction: exact
+	// and simple, but it holds a transaction open for as long as it takes and
+	// cannot be resumed if it is interrupted.
+	//
+	// chunked reads primary-key ranges interleaved with the stream, using
+	// watermarks to drop rows the stream has already superseded. It holds no
+	// long transaction, survives a restart, and suits tables too large to read
+	// in one pass. It needs PostgreSQL 14 or newer and a primary key on every
+	// captured table.
+	SnapshotMode string `yaml:"snapshot_mode"`
+	// ChunkSize is how many rows one chunk reads. Defaults to 10000.
+	ChunkSize int `yaml:"chunk_size"`
 }
 
 // MySQL configures the binlog reader (see internal/source/mysql).
@@ -159,6 +179,11 @@ type SinkConfig struct {
 	// RetryInitial and RetryMax bound the write backoff.
 	RetryInitial Duration `yaml:"retry_initial"`
 	RetryMax     Duration `yaml:"retry_max"`
+	// Encoding is the wire format for sinks that ship raw event payloads
+	// (nats, kafka, process): "json" (default) or "protobuf". Sinks with their
+	// own representation — pgupsert writes SQL, webhook posts a JSON envelope,
+	// stdout prints JSON lines — do not take one.
+	Encoding string `yaml:"encoding"`
 	// OnFailure decides what happens when a sink keeps rejecting a batch.
 	//
 	// "retry" (the default) retries forever: nothing is ever lost, but one
@@ -174,6 +199,24 @@ type SinkConfig struct {
 	PGUpsert PGUpsertSink `yaml:"pgupsert"`
 	NATS     NATSSink     `yaml:"nats"`
 	Kafka    KafkaSink    `yaml:"kafka"`
+	Process  ProcessSink  `yaml:"process"`
+}
+
+// ProcessSink hands events to a program over its standard input, so a sink can
+// be written in any language without this project growing an RPC protocol.
+type ProcessSink struct {
+	// Command is the program and its arguments.
+	Command []string `yaml:"command"`
+	// Dir is the working directory for the child process.
+	Dir string `yaml:"dir"`
+	// Env entries are appended to the child's environment as KEY=VALUE.
+	Env []string `yaml:"env"`
+	// Timeout bounds how long one batch may take before the sink gives up and
+	// the pipeline retries.
+	Timeout Duration `yaml:"timeout"`
+	// RestartOnError starts a fresh process after a failed batch, rather than
+	// keeping one that may be in a bad state.
+	RestartOnError bool `yaml:"restart_on_error"`
 }
 
 // NATSSink publishes events to NATS, one message per event.
@@ -210,6 +253,12 @@ type KafkaSink struct {
 	AutoCreateTopics bool                `yaml:"auto_create_topics"`
 	Timeout          Duration            `yaml:"timeout"`
 }
+
+// Snapshot modes for sources that support more than one.
+const (
+	SnapshotSingle  = "single"
+	SnapshotChunked = "chunked"
+)
 
 // Failure policies for a sink that keeps rejecting a batch.
 const (
@@ -253,11 +302,26 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 
+	if cfg.Pipeline.ID != "" && len(cfg.Pipelines) > 0 {
+		return nil, fmt.Errorf("config: set either pipeline: or pipelines:, not both")
+	}
+
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// AllPipelines is every configured pipeline, however it was written.
+func (c *Config) AllPipelines() []Pipeline {
+	if len(c.Pipelines) > 0 {
+		return c.Pipelines
+	}
+	if c.Pipeline.ID != "" {
+		return []Pipeline{c.Pipeline}
+	}
+	return nil
 }
 
 func (c *Config) applyDefaults() {
@@ -274,21 +338,39 @@ func (c *Config) applyDefaults() {
 	if c.ControlPlane.LeaseRenew == 0 {
 		c.ControlPlane.LeaseRenew = Duration(c.ControlPlane.LeaseTTL.D() / 3)
 	}
-	if c.Pipeline.CommitInterval == 0 {
-		c.Pipeline.CommitInterval = Duration(time.Second)
+	if len(c.Pipelines) == 0 && c.Pipeline.ID != "" {
+		c.Pipelines = []Pipeline{c.Pipeline}
 	}
-	if c.Pipeline.Source.ID == "" {
-		c.Pipeline.Source.ID = c.Pipeline.ID
+	for i := range c.Pipelines {
+		applyPipelineDefaults(&c.Pipelines[i])
 	}
-	if c.Pipeline.Source.Postgres.Slot == "" {
-		c.Pipeline.Source.Postgres.Slot = slug("slipstream_" + c.Pipeline.ID)
+	if len(c.Pipelines) == 1 {
+		c.Pipeline = c.Pipelines[0]
 	}
-	if c.Pipeline.Source.Postgres.Publication == "" {
-		c.Pipeline.Source.Postgres.Publication = slug("slipstream_" + c.Pipeline.ID)
+}
+
+func applyPipelineDefaults(p *Pipeline) {
+	if p.CommitInterval == 0 {
+		p.CommitInterval = Duration(time.Second)
+	}
+	if p.Source.ID == "" {
+		p.Source.ID = p.ID
+	}
+	if p.Source.Postgres.SnapshotMode == "" {
+		p.Source.Postgres.SnapshotMode = SnapshotSingle
+	}
+	if p.Source.Postgres.ChunkSize == 0 {
+		p.Source.Postgres.ChunkSize = 10000
+	}
+	if p.Source.Postgres.Slot == "" {
+		p.Source.Postgres.Slot = slug("slipstream_" + p.ID)
+	}
+	if p.Source.Postgres.Publication == "" {
+		p.Source.Postgres.Publication = slug("slipstream_" + p.ID)
 	}
 
-	for i := range c.Pipeline.Sinks {
-		s := &c.Pipeline.Sinks[i]
+	for i := range p.Sinks {
+		s := &p.Sinks[i]
 		if s.Name == "" {
 			s.Name = s.Type
 		}
@@ -319,11 +401,17 @@ func (c *Config) applyDefaults() {
 		if s.Kafka.Timeout == 0 {
 			s.Kafka.Timeout = Duration(30 * time.Second)
 		}
+		if s.Process.Timeout == 0 {
+			s.Process.Timeout = Duration(60 * time.Second)
+		}
 		if s.PGUpsert.DeletedCol == "" {
 			s.PGUpsert.DeletedCol = "_deleted_at"
 		}
 		if s.OnFailure == "" {
 			s.OnFailure = OnFailureRetry
+		}
+		if s.Encoding == "" {
+			s.Encoding = "json"
 		}
 	}
 }
@@ -336,25 +424,59 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: control_plane.lease_renew (%s) must be shorter than lease_ttl (%s)",
 			c.ControlPlane.LeaseRenew.D(), c.ControlPlane.LeaseTTL.D())
 	}
-	if c.Pipeline.ID == "" {
-		return fmt.Errorf("config: pipeline.id is required")
-	}
-	if c.Pipeline.Source.Type == "" {
-		return fmt.Errorf("config: pipeline.source.type is required")
-	}
-	if len(c.Pipeline.Sinks) == 0 {
-		return fmt.Errorf("config: pipeline.sinks must list at least one sink")
+	if len(c.Pipelines) == 0 {
+		return fmt.Errorf("config: define a pipeline (pipeline:) or several (pipelines:)")
 	}
 
-	seen := make(map[string]bool, len(c.Pipeline.Sinks))
-	for _, s := range c.Pipeline.Sinks {
+	seenPipelines := make(map[string]bool, len(c.Pipelines))
+	for _, p := range c.Pipelines {
+		if p.ID == "" {
+			return fmt.Errorf("config: every pipeline needs an id")
+		}
+		if seenPipelines[p.ID] {
+			return fmt.Errorf("config: duplicate pipeline id %q; ids key the leases and offsets", p.ID)
+		}
+		seenPipelines[p.ID] = true
+		if err := validatePipeline(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePipeline(p Pipeline) error {
+	if p.Source.Type == "" {
+		return fmt.Errorf("config: pipeline %q has no source.type", p.ID)
+	}
+	switch p.Source.Postgres.SnapshotMode {
+	case SnapshotSingle, SnapshotChunked:
+	default:
+		return fmt.Errorf("config: pipeline %q has snapshot_mode %q, want %q or %q",
+			p.ID, p.Source.Postgres.SnapshotMode, SnapshotSingle, SnapshotChunked)
+	}
+	if len(p.Sinks) == 0 {
+		return fmt.Errorf("config: pipeline %q must list at least one sink", p.ID)
+	}
+
+	seen := make(map[string]bool, len(p.Sinks))
+	for _, s := range p.Sinks {
 		if s.Type == "" {
-			return fmt.Errorf("config: sink %q has no type", s.Name)
+			return fmt.Errorf("config: pipeline %q has a sink %q with no type", p.ID, s.Name)
 		}
 		if seen[s.Name] {
-			return fmt.Errorf("config: duplicate sink name %q; names key the sink_cursor rows", s.Name)
+			return fmt.Errorf("config: pipeline %q has duplicate sink name %q; names key the sink_cursor rows",
+				p.ID, s.Name)
 		}
 		seen[s.Name] = true
+
+		switch s.Type {
+		case "nats", "kafka", "process":
+		default:
+			if s.Encoding != "json" {
+				return fmt.Errorf("config: sink %q is of type %q, which has its own representation "+
+					"and takes no encoding (got %q)", s.Name, s.Type, s.Encoding)
+			}
+		}
 
 		switch s.OnFailure {
 		case OnFailureRetry:

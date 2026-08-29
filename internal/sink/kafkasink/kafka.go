@@ -3,7 +3,6 @@ package kafkasink
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -12,19 +11,25 @@ import (
 
 	"github.com/aupv9/slipstream/internal/cdc"
 	"github.com/aupv9/slipstream/internal/config"
+	"github.com/aupv9/slipstream/internal/encoding"
 )
 
 // Sink writes one Kafka message per change event.
 type Sink struct {
 	name   string
 	cfg    config.KafkaSink
+	enc    encoding.Encoder
 	writer *kafka.Writer
 }
 
 // New builds a Kafka writer. It does not connect until the first write.
-func New(name string, cfg config.KafkaSink) (*Sink, error) {
+func New(name string, cfg config.KafkaSink, format encoding.Format) (*Sink, error) {
 	if len(cfg.Brokers) == 0 {
 		return nil, fmt.Errorf("kafka sink %q: brokers are required", name)
+	}
+	enc, err := encoding.New(format)
+	if err != nil {
+		return nil, fmt.Errorf("kafka sink %q: %w", name, err)
 	}
 
 	w := &kafka.Writer{
@@ -42,7 +47,7 @@ func New(name string, cfg config.KafkaSink) (*Sink, error) {
 		w.Compression = kafka.Gzip
 	}
 
-	return &Sink{name: name, cfg: cfg, writer: w}, nil
+	return &Sink{name: name, cfg: cfg, enc: enc, writer: w}, nil
 }
 
 // Name identifies the sink.
@@ -87,9 +92,9 @@ func (s *Sink) Write(ctx context.Context, batch []cdc.ChangeEvent) error {
 // Message builds the Kafka message for one event. Exported so the mapping can
 // be tested without a broker.
 func (s *Sink) Message(ev cdc.ChangeEvent) (kafka.Message, error) {
-	payload, err := json.Marshal(ev)
+	payload, err := s.enc.Encode(ev)
 	if err != nil {
-		return kafka.Message{}, fmt.Errorf("kafka sink %q: marshal %s: %w", s.name, ev.Position, err)
+		return kafka.Message{}, fmt.Errorf("kafka sink %q: %w", s.name, err)
 	}
 	return kafka.Message{
 		Topic: Topic(s.cfg.TopicPrefix, s.cfg.Topic, ev),
@@ -100,6 +105,7 @@ func (s *Sink) Message(ev cdc.ChangeEvent) (kafka.Message, error) {
 			{Key: "slipstream-source", Value: []byte(ev.SourceID)},
 			{Key: "slipstream-position", Value: []byte(ev.Position)},
 			{Key: "idempotency-key", Value: []byte(ev.IdempotencyKey())},
+			{Key: "content-type", Value: []byte(s.enc.ContentType())},
 		},
 	}, nil
 }

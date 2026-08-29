@@ -23,6 +23,9 @@ control_plane:
   # Applies the (idempotent) control-plane schema on startup.
   auto_migrate: true
 
+# One pipeline, or several with `pipelines:` (a list of the same shape). Each
+# keeps its own lease and offset, so one process can lead some and stand by for
+# others.
 pipeline:
   id: pg-main
   # How often the slowest sink's position is promoted to the pipeline offset
@@ -52,6 +55,16 @@ pipeline:
       auto_add_tables: false
       # Take a consistent initial snapshot when there is no stored offset.
       snapshot: true
+      # single (default) reads every table inside one exported-snapshot
+      # transaction: exact, but it holds a transaction open for the duration and
+      # cannot be resumed if interrupted.
+      #
+      # chunked reads primary-key ranges alongside the stream, using watermarks
+      # to drop rows the stream has already superseded. No long transaction, it
+      # survives a restart, and it suits tables too large to read in one pass.
+      # Needs PostgreSQL 14+ and a primary key on every captured table.
+      snapshot_mode: single
+      chunk_size: 10000
 
     # MySQL: needs binlog_format=ROW, binlog_row_image=FULL and gtid_mode=ON;
     # the reader refuses to start otherwise rather than emit partial events.
@@ -102,12 +115,24 @@ pipeline:
         headers:
           Authorization: Bearer ${SLIPSTREAM_WEBHOOK_TOKEN}
 
+    # Any language can be a sink: the program reads one JSON batch per line on
+    # stdin and answers {"ok":true} or {"ok":false,"error":"..."} per line. A
+    # rejected batch is retried under this sink's failure policy, and a retry
+    # carries the same batch_id so the program can spot the replay.
+    # - name: custom
+    #   type: process
+    #   process:
+    #     command: [python3, /opt/sinks/warehouse.py]
+    #     timeout: 60s
+    #     restart_on_error: true
+
     # NATS with JetStream: publishes are acknowledged, and the event's
     # idempotency key is sent as Nats-Msg-Id so the server drops replays inside
     # the stream's duplicate window. core_only: true skips JetStream and gives
     # up that guarantee.
     # - name: bus
     #   type: nats
+    #   encoding: json          # or protobuf, for nats/kafka/process sinks
     #   nats:
     #     url: nats://127.0.0.1:4222
     #     subject_prefix: cdc

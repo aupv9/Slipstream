@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package slipstream.v1;
+
+option go_package = "github.com/aupv9/slipstream/internal/encoding/eventpb";
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// ChangeEvent mirrors cdc.ChangeEvent on the wire.
+message ChangeEvent {
+  string source_id = 1;
+  string schema = 2;
+  string table = 3;
+  // op is c (create), u (update), d (delete), r (snapshot read) or t (truncate).
+  string op = 4;
+  google.protobuf.Struct before = 5;
+  google.protobuf.Struct after = 6;
+  string position = 7;
+  google.protobuf.Timestamp commit_ts = 8;
+}

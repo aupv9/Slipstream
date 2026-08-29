@@ -44,8 +44,13 @@ CREATE TABLE IF NOT EXISTS snapshot_state (
     completed_at   timestamptz
 );
 
+-- Added after the first release; idempotent so upgrades need no separate step.
+ALTER TABLE snapshot_state ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'single';
+ALTER TABLE snapshot_state ADD COLUMN IF NOT EXISTS chunk_table text NOT NULL DEFAULT '';
+ALTER TABLE snapshot_state ADD COLUMN IF NOT EXISTS chunk_key jsonb;
+
 COMMENT ON TABLE snapshot_state IS
-    'Whether the initial snapshot finished. An offset written while phase = running covers only part of the snapshot, so it must never be resumed from: the pipeline re-bootstraps instead.';
+    'Whether the initial snapshot finished, how it was taken, and how far a chunked one got. A single-transaction snapshot interrupted midway leaves an offset covering only part of the data, so it must never be resumed from; a chunked snapshot streams from the start and is resumable, which is what chunk_table and chunk_key record.';
 
 CREATE TABLE IF NOT EXISTS dead_letters (
     id          bigserial   PRIMARY KEY,

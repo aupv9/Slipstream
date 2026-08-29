@@ -20,6 +20,7 @@ import (
 
 	"github.com/aupv9/slipstream/internal/cdc"
 	"github.com/aupv9/slipstream/internal/config"
+	"github.com/aupv9/slipstream/internal/controlplane"
 	"github.com/aupv9/slipstream/internal/source"
 )
 
@@ -44,17 +45,25 @@ type Reader struct {
 	// keepalives and data messages. The gap to ackLSN is the WAL the server is
 	// still holding for us.
 	serverLSN atomic.Uint64
+	// lastEmitted is the position of the last event handed to the pipeline.
+	lastEmitted atomic.Uint64
+	// caughtUp is true when every event emitted so far has been acknowledged,
+	// which is what makes it safe to acknowledge past uncaptured WAL.
+	caughtUp atomic.Bool
 }
 
 // New builds a Postgres reader. Nothing is connected until ReadChanges runs.
 func New(cfg config.Postgres, sourceID string, log *slog.Logger) *Reader {
-	return &Reader{
+	r := &Reader{
 		cfg:      cfg,
 		sourceID: sourceID,
 		log:      log.With("source", "postgres", "slot", cfg.Slot),
 		rels:     make(map[uint32]*pglogrepl.RelationMessage),
 		typeMap:  pgtype.NewMap(),
 	}
+	// Nothing emitted yet means nothing outstanding.
+	r.caughtUp.Store(true)
+	return r
 }
 
 // Name identifies the reader.
@@ -68,12 +77,20 @@ func (r *Reader) Ack(position string) {
 	if err != nil {
 		return
 	}
+	// Everything emitted has now been accepted, so the slot no longer needs to
+	// hold WAL on account of this pipeline.
+	r.caughtUp.Store(uint64(lsn) >= r.lastEmitted.Load())
+	advance(&r.ackLSN, uint64(lsn))
+}
+
+// advance raises an atomic to v if v is further along.
+func advance(target *atomic.Uint64, v uint64) {
 	for {
-		cur := r.ackLSN.Load()
-		if uint64(lsn) <= cur {
+		cur := target.Load()
+		if v <= cur {
 			return
 		}
-		if r.ackLSN.CompareAndSwap(cur, uint64(lsn)) {
+		if target.CompareAndSwap(cur, v) {
 			return
 		}
 	}
@@ -94,15 +111,23 @@ func (r *Reader) LagBytes() (int64, bool) {
 
 // noteServerPosition records the furthest position the server has reported.
 func (r *Reader) noteServerPosition(lsn pglogrepl.LSN) {
-	for {
-		cur := r.serverLSN.Load()
-		if uint64(lsn) <= cur {
-			return
-		}
-		if r.serverLSN.CompareAndSwap(cur, uint64(lsn)) {
-			return
-		}
+	advance(&r.serverLSN, uint64(lsn))
+}
+
+// noteIdleProgress acknowledges WAL the server has sent that produced nothing
+// for us to deliver.
+//
+// Without this, a slot pins WAL forever whenever the captured tables are quiet
+// while the rest of the database is busy: the acknowledged position only moves
+// when one of our own events is committed, so the gap — and the disk usage —
+// grows without bound. A keepalive is only sent after every data message before
+// it, so once everything already emitted has been acknowledged, the position it
+// reports is safe to acknowledge too.
+func (r *Reader) noteIdleProgress(serverEnd pglogrepl.LSN) {
+	if !r.caughtUp.Load() {
+		return
 	}
+	advance(&r.ackLSN, uint64(serverEnd))
 }
 
 // Close drops the replication connection.
@@ -139,6 +164,8 @@ func (r *Reader) ReadChanges(ctx context.Context, req source.ReadRequest, out ch
 	r.repl = repl
 	defer r.Close()
 
+	chunked := r.cfg.SnapshotMode == config.SnapshotChunked && r.cfg.Snapshot
+
 	var startLSN pglogrepl.LSN
 	if req.From != "" && !req.ForceBootstrap {
 		if startLSN, err = pglogrepl.ParseLSN(req.From); err != nil {
@@ -156,8 +183,29 @@ func (r *Reader) ReadChanges(ctx context.Context, req source.ReadRequest, out ch
 		}
 	}
 
+	// A chunked snapshot runs inside the stream loop, so it also has to be set
+	// up when resuming an interrupted one.
+	var chunk *chunker
+	if chunked && !r.snapshotComplete(req) {
+		size := r.cfg.ChunkSize
+		if size <= 0 {
+			size = 10000
+		}
+		if chunk, err = newChunker(ctx, r, admin, req.Hooks, req.ResumeSnapshot, size); err != nil {
+			return err
+		}
+	}
+
 	r.ackLSN.Store(uint64(startLSN))
-	return r.stream(ctx, startLSN, out)
+	return r.stream(ctx, startLSN, chunk, out)
+}
+
+// snapshotComplete reports whether the snapshot is already finished, in which
+// case this run only streams.
+func (r *Reader) snapshotComplete(req source.ReadRequest) bool {
+	// A resume with no snapshot to continue means the previous snapshot
+	// finished; a bootstrap always starts one.
+	return req.From != "" && !req.ForceBootstrap && req.ResumeSnapshot == nil
 }
 
 // connectReplication opens the streaming connection. The replication parameter
@@ -201,15 +249,24 @@ func (r *Reader) bootstrap(ctx context.Context, admin *pgx.Conn, req source.Read
 		return 0, err
 	}
 
+	chunked := r.cfg.SnapshotMode == config.SnapshotChunked && r.cfg.Snapshot
+	mode := controlplane.SnapshotSingle
+	if chunked {
+		mode = controlplane.SnapshotChunked
+	}
+
 	// Mark the snapshot as started before anything is emitted, so an instance
-	// that dies partway through leaves evidence that its offset is partial.
+	// that dies partway through leaves evidence about its offset: partial for a
+	// single-transaction snapshot, resumable for a chunked one.
 	if req.Hooks != nil {
-		if err := req.Hooks.SnapshotStarted(ctx); err != nil {
+		if err := req.Hooks.SnapshotStarted(ctx, mode); err != nil {
 			return 0, fmt.Errorf("postgres: record snapshot start: %w", err)
 		}
 	}
 
-	action, err := snapshotAction(ctx, admin, r.cfg.Snapshot)
+	// A chunked snapshot reads key ranges alongside the stream, so it needs no
+	// exported snapshot and no long-lived transaction.
+	action, err := snapshotAction(ctx, admin, r.cfg.Snapshot && !chunked)
 	if err != nil {
 		return 0, err
 	}
@@ -235,11 +292,19 @@ func (r *Reader) bootstrap(ctx context.Context, admin *pgx.Conn, req source.Read
 	}
 	r.log.Info("created replication slot", "consistent_point", consistent, "snapshot", slot.SnapshotName)
 
-	if r.cfg.Snapshot {
+	switch {
+	case chunked:
+		// The chunker runs inside the stream loop and reports completion
+		// itself, once every table has been read.
+		r.log.Info("chunked snapshot will run alongside the stream", "chunk_size", r.cfg.ChunkSize)
+		return consistent, nil
+
+	case r.cfg.Snapshot:
 		if err := r.snapshot(ctx, admin, slot.SnapshotName, consistent, out); err != nil {
 			return 0, err
 		}
-	} else {
+
+	default:
 		r.log.Info("snapshot disabled; streaming only from the slot's consistent point")
 	}
 
@@ -385,10 +450,15 @@ func (r *Reader) snapshotTable(ctx context.Context, tx pgx.Tx, t table, at pglog
 
 // stream is the replication loop: decode pgoutput messages, emit row events,
 // and periodically report the acknowledged LSN.
-func (r *Reader) stream(ctx context.Context, startLSN pglogrepl.LSN, out chan<- cdc.ChangeEvent) error {
+func (r *Reader) stream(ctx context.Context, startLSN pglogrepl.LSN, chunk *chunker, out chan<- cdc.ChangeEvent) error {
 	args := []string{
 		"proto_version '1'",
 		fmt.Sprintf("publication_names '%s'", r.cfg.Publication),
+	}
+	if chunk != nil {
+		// The chunker's watermarks travel as logical decoding messages, which
+		// pgoutput only forwards when asked.
+		args = append(args, "messages 'true'")
 	}
 	if err := pglogrepl.StartReplication(ctx, r.repl, r.cfg.Slot, startLSN,
 		pglogrepl.StartReplicationOptions{PluginArgs: args}); err != nil {
@@ -408,6 +478,12 @@ func (r *Reader) stream(ctx context.Context, startLSN pglogrepl.LSN, out chan<- 
 				return err
 			}
 			nextStandby = time.Now().Add(standbyInterval)
+		}
+
+		if chunk != nil && chunk.idle() {
+			if err := chunk.startChunk(ctx); err != nil {
+				return err
+			}
 		}
 
 		recvCtx, cancel := context.WithDeadline(ctx, nextStandby)
@@ -440,6 +516,7 @@ func (r *Reader) stream(ctx context.Context, startLSN pglogrepl.LSN, out chan<- 
 				return fmt.Errorf("postgres: parse keepalive: %w", err)
 			}
 			r.noteServerPosition(ka.ServerWALEnd)
+			r.noteIdleProgress(ka.ServerWALEnd)
 			if ka.ReplyRequested {
 				if err := r.sendStandbyUpdate(ctx); err != nil {
 					return err
@@ -460,15 +537,21 @@ func (r *Reader) stream(ctx context.Context, startLSN pglogrepl.LSN, out chan<- 
 				r.log.Debug("skipping undecodable message", "err", err)
 				continue
 			}
-			if err := r.handle(ctx, msg, xld, &txCommitTS, out); err != nil {
+			if err := r.handle(ctx, msg, xld, &txCommitTS, chunk, out); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (r *Reader) handle(ctx context.Context, msg pglogrepl.Message, xld pglogrepl.XLogData, txCommitTS *time.Time, out chan<- cdc.ChangeEvent) error {
+func (r *Reader) handle(ctx context.Context, msg pglogrepl.Message, xld pglogrepl.XLogData, txCommitTS *time.Time, chunk *chunker, out chan<- cdc.ChangeEvent) error {
 	switch m := msg.(type) {
+	case *pglogrepl.LogicalDecodingMessage:
+		if chunk != nil {
+			return chunk.onMessage(ctx, m, xld, out)
+		}
+		return nil
+
 	case *pglogrepl.RelationMessage:
 		r.rels[m.RelationID] = m
 		return nil
@@ -486,14 +569,14 @@ func (r *Reader) handle(ctx context.Context, msg pglogrepl.Message, xld pglogrep
 		if !ok {
 			return fmt.Errorf("postgres: insert for unknown relation %d", m.RelationID)
 		}
-		return emit(ctx, out, r.event(rel, cdc.OpCreate, nil, r.decodeTuple(rel, m.Tuple), xld, *txCommitTS))
+		return r.emitRow(ctx, chunk, out, r.event(rel, cdc.OpCreate, nil, r.decodeTuple(rel, m.Tuple), xld, *txCommitTS))
 
 	case *pglogrepl.UpdateMessage:
 		rel, ok := r.rels[m.RelationID]
 		if !ok {
 			return fmt.Errorf("postgres: update for unknown relation %d", m.RelationID)
 		}
-		return emit(ctx, out, r.event(rel, cdc.OpUpdate,
+		return r.emitRow(ctx, chunk, out, r.event(rel, cdc.OpUpdate,
 			r.decodeTuple(rel, m.OldTuple), r.decodeTuple(rel, m.NewTuple), xld, *txCommitTS))
 
 	case *pglogrepl.DeleteMessage:
@@ -501,7 +584,7 @@ func (r *Reader) handle(ctx context.Context, msg pglogrepl.Message, xld pglogrep
 		if !ok {
 			return fmt.Errorf("postgres: delete for unknown relation %d", m.RelationID)
 		}
-		return emit(ctx, out, r.event(rel, cdc.OpDelete, r.decodeTuple(rel, m.OldTuple), nil, xld, *txCommitTS))
+		return r.emitRow(ctx, chunk, out, r.event(rel, cdc.OpDelete, r.decodeTuple(rel, m.OldTuple), nil, xld, *txCommitTS))
 
 	case *pglogrepl.TruncateMessage:
 		// One TRUNCATE can name several relations. Dropping this message would
@@ -511,7 +594,7 @@ func (r *Reader) handle(ctx context.Context, msg pglogrepl.Message, xld pglogrep
 			if !ok {
 				return fmt.Errorf("postgres: truncate for unknown relation %d", id)
 			}
-			if err := emit(ctx, out, r.event(rel, cdc.OpTruncate, nil, nil, xld, *txCommitTS)); err != nil {
+			if err := r.emitRow(ctx, chunk, out, r.event(rel, cdc.OpTruncate, nil, nil, xld, *txCommitTS)); err != nil {
 				return err
 			}
 		}
@@ -520,6 +603,19 @@ func (r *Reader) handle(ctx context.Context, msg pglogrepl.Message, xld pglogrep
 	default:
 		return nil
 	}
+}
+
+// emitRow sends a streamed change, first letting a running chunk note that this
+// row has been overtaken.
+func (r *Reader) emitRow(ctx context.Context, chunk *chunker, out chan<- cdc.ChangeEvent, ev cdc.ChangeEvent) error {
+	if chunk != nil {
+		chunk.observe(ev)
+	}
+	if lsn, err := pglogrepl.ParseLSN(ev.Position); err == nil {
+		advance(&r.lastEmitted, uint64(lsn))
+		r.caughtUp.Store(false)
+	}
+	return emit(ctx, out, ev)
 }
 
 func (r *Reader) event(rel *pglogrepl.RelationMessage, op cdc.Op, before, after map[string]any, xld pglogrepl.XLogData, commitTS time.Time) cdc.ChangeEvent {
