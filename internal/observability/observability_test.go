@@ -2,6 +2,7 @@ package observability
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -85,14 +86,50 @@ func TestNilRegistryIsUsable(t *testing.T) {
 	}
 }
 
+// One process can lead some pipelines and stand by for others, so readiness
+// has to report them separately rather than as one flag.
+func TestHealthTracksEachPipelineSeparately(t *testing.T) {
+	r := NewRegistry()
+	Register(r)
+	health := &Health{}
+	health.SetRole("orders", true)
+	health.SetStreaming("orders", true)
+	health.SetRole("customers", false)
+	health.SetError("customers", errors.New("lease lost"))
+
+	srv := NewServer("127.0.0.1:0", r, health, quiet())
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Stop(ctx)
+	})
+
+	body, code := get(t, "http://"+srv.Addr()+"/readyz")
+	if code != http.StatusOK {
+		t.Fatalf("status %d", code)
+	}
+	if !strings.Contains(body, "pipeline: orders role: leader streaming: true") {
+		t.Errorf("orders line missing from:\n%s", body)
+	}
+	if !strings.Contains(body, "pipeline: customers role: standby") {
+		t.Errorf("customers line missing from:\n%s", body)
+	}
+	if !strings.Contains(body, "lease lost") {
+		t.Errorf("the last error should be visible:\n%s", body)
+	}
+}
+
 func TestServerServesMetricsAndHealth(t *testing.T) {
 	r := NewRegistry()
 	Register(r)
 	r.Set(MetricLagBytes, []string{"pipeline", "p1"}, 128)
 
 	health := &Health{}
-	health.Leader.Store(true)
-	health.Streaming.Store(true)
+	health.SetRole("p1", true)
+	health.SetStreaming("p1", true)
 
 	// Port 0 lets the OS pick, so tests never collide.
 	srv := NewServer("127.0.0.1:0", r, health, quiet())
@@ -125,10 +162,13 @@ func TestServerServesMetricsAndHealth(t *testing.T) {
 	if !strings.Contains(body, "role: leader") || !strings.Contains(body, "streaming: true") {
 		t.Errorf("/readyz body = %q", body)
 	}
+	if !strings.Contains(body, "pipeline: p1") {
+		t.Errorf("/readyz should name each pipeline: %q", body)
+	}
 
 	// A standby is healthy and ready: it is meant to be idle.
-	health.Leader.Store(false)
-	health.Streaming.Store(false)
+	health.SetRole("p1", false)
+	health.SetStreaming("p1", false)
 	body, code = get(t, base+"/readyz")
 	if code != http.StatusOK {
 		t.Errorf("standby /readyz status %d, want 200: taking standbys out of service defeats the point", code)

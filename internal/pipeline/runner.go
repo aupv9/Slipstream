@@ -25,36 +25,40 @@ const eventBuffer = 1024
 // holds it, runs the source reader and the sink fan-out. Run two or more of
 // these against the same control plane and the pipeline is highly available.
 type Runner struct {
-	cfg     *config.Config
-	store   *controlplane.Store
-	metrics *observability.Registry
-	health  *observability.Health
-	log     *slog.Logger
+	instanceID string
+	cp         config.ControlPlane
+	pipeline   config.Pipeline
+	store      *controlplane.Store
+	metrics    *observability.Registry
+	health     *observability.Health
+	log        *slog.Logger
 }
 
-// NewRunner builds a runner. metrics and health may be nil when the endpoints
-// are disabled.
-func NewRunner(cfg *config.Config, store *controlplane.Store, metrics *observability.Registry, health *observability.Health, log *slog.Logger) *Runner {
+// NewRunner builds a runner for one pipeline. metrics and health may be nil
+// when the endpoints are disabled.
+func NewRunner(instanceID string, cp config.ControlPlane, pipeline config.Pipeline, store *controlplane.Store, metrics *observability.Registry, health *observability.Health, log *slog.Logger) *Runner {
 	if health == nil {
 		health = &observability.Health{}
 	}
 	return &Runner{
-		cfg:     cfg,
-		store:   store,
-		metrics: metrics,
-		health:  health,
-		log:     log.With("pipeline", cfg.Pipeline.ID, "instance", cfg.InstanceID),
+		instanceID: instanceID,
+		cp:         cp,
+		pipeline:   pipeline,
+		store:      store,
+		metrics:    metrics,
+		health:     health,
+		log:        log.With("pipeline", pipeline.ID, "instance", instanceID),
 	}
 }
 
 // pipelineLabels are the metric labels for this runner.
 func (r *Runner) pipelineLabels() []string {
-	return []string{"pipeline", r.cfg.Pipeline.ID, "instance", r.cfg.InstanceID}
+	return []string{"pipeline", r.pipeline.ID, "instance", r.instanceID}
 }
 
 // setRole publishes whether this instance is the leader.
 func (r *Runner) setRole(leader bool) {
-	r.health.Leader.Store(leader)
+	r.health.SetRole(r.pipeline.ID, leader)
 	var v int64
 	if leader {
 		v = 1
@@ -64,7 +68,7 @@ func (r *Runner) setRole(leader bool) {
 
 // Run blocks until ctx is cancelled, alternating between standby and leader.
 func (r *Runner) Run(ctx context.Context) error {
-	renew := r.cfg.ControlPlane.LeaseRenew.D()
+	renew := r.cp.LeaseRenew.D()
 	standby := false
 
 	for {
@@ -72,7 +76,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return nil
 		}
 
-		leader, err := r.store.AcquireOrRenew(ctx, r.cfg.Pipeline.ID, r.cfg.InstanceID, r.cfg.ControlPlane.LeaseTTL.D())
+		leader, err := r.store.AcquireOrRenew(ctx, r.pipeline.ID, r.instanceID, r.cp.LeaseTTL.D())
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -87,7 +91,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if !leader {
 			r.setRole(false)
 			if !standby {
-				holder, _ := r.store.LeaseHolder(ctx, r.cfg.Pipeline.ID)
+				holder, _ := r.store.LeaseHolder(ctx, r.pipeline.ID)
 				r.log.Info("standby: another instance holds the lease", "holder", holder)
 				standby = true
 			}
@@ -102,8 +106,8 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.log.Info("acquired lease; becoming leader")
 		err = r.lead(ctx)
 		r.setRole(false)
-		r.health.Streaming.Store(false)
-		r.health.SetError(err)
+		r.health.SetStreaming(r.pipeline.ID, false)
+		r.health.SetError(r.pipeline.ID, err)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -144,7 +148,7 @@ func (r *Runner) lead(ctx context.Context) error {
 	// waiting out the TTL. Guarded by holder, so it cannot expire someone
 	// else's lease.
 	release, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	if rerr := r.store.Release(release, r.cfg.Pipeline.ID, r.cfg.InstanceID); rerr != nil {
+	if rerr := r.store.Release(release, r.pipeline.ID, r.instanceID); rerr != nil {
 		r.log.Warn("could not release lease; standby will wait out the TTL", "err", rerr)
 	}
 	rcancel()
@@ -156,8 +160,8 @@ func (r *Runner) lead(ctx context.Context) error {
 // to the TTL, but cancels the run immediately if another instance has taken
 // the lease.
 func (r *Runner) heartbeat(ctx context.Context, cancel context.CancelFunc) {
-	ttl := r.cfg.ControlPlane.LeaseTTL.D()
-	renew := r.cfg.ControlPlane.LeaseRenew.D()
+	ttl := r.cp.LeaseTTL.D()
+	renew := r.cp.LeaseRenew.D()
 	ticker := time.NewTicker(renew)
 	defer ticker.Stop()
 
@@ -169,7 +173,7 @@ func (r *Runner) heartbeat(ctx context.Context, cancel context.CancelFunc) {
 		case <-ticker.C:
 		}
 
-		held, err := r.store.AcquireOrRenew(ctx, r.cfg.Pipeline.ID, r.cfg.InstanceID, ttl)
+		held, err := r.store.AcquireOrRenew(ctx, r.pipeline.ID, r.instanceID, ttl)
 		switch {
 		case err != nil:
 			if ctx.Err() != nil {
@@ -196,37 +200,57 @@ type resumeDecision struct {
 	From           string
 	ForceBootstrap bool
 	Reason         string
+	// ResumeSnapshot continues an interrupted chunked snapshot.
+	ResumeSnapshot *source.SnapshotResume
 }
 
 // planResume decides whether a stored offset may be resumed from.
 //
-// An offset is only trustworthy once the initial snapshot has been recorded as
-// complete. While a snapshot runs, sinks accept its rows and the offset
-// advances to the slot's consistent point — so an instance that dies midway
-// leaves behind an offset that looks perfectly resumable but only covers the
-// part of the snapshot that had been read. Resuming from it streams on from
-// there and the unread rows are never delivered: the pipeline looks healthy and
-// silently misses data forever. When in doubt, snapshot again; a redundant
-// snapshot costs time, a skipped one costs data.
-func planResume(offset string, offsetFound bool, phase string, phaseFound bool) resumeDecision {
+// An offset written during a single-transaction snapshot is not trustworthy.
+// Sinks accept snapshot rows as they arrive, so the offset advances to the
+// slot's consistent point while the snapshot is still running; an instance that
+// dies midway leaves an offset that looks perfectly resumable but only covers
+// the part of the snapshot already read. Resuming from it streams on and the
+// unread rows are never delivered — a healthy-looking pipeline, permanently
+// missing data. When in doubt, snapshot again: a redundant snapshot costs time,
+// a skipped one costs data.
+//
+// A chunked snapshot is different, and better. It streams from the very
+// beginning and reads key ranges alongside the stream, so the offset is
+// meaningful the whole way through and the snapshot picks up from its last
+// chunk instead of starting over.
+func planResume(offset string, offsetFound bool, state controlplane.SnapshotState, stateFound bool) resumeDecision {
 	switch {
-	case !phaseFound:
+	case !stateFound:
 		return resumeDecision{
 			From:           offset,
 			ForceBootstrap: true,
 			Reason:         "no completed snapshot is recorded for this pipeline",
 		}
-	case phase == controlplane.SnapshotRunning:
+
+	case state.Phase == controlplane.SnapshotRunning && state.Mode == controlplane.SnapshotChunked && offsetFound:
+		return resumeDecision{
+			From:   offset,
+			Reason: "continuing an interrupted chunked snapshot from its last chunk",
+			ResumeSnapshot: &source.SnapshotResume{
+				Table: state.ChunkTable,
+				Key:   state.ChunkKey,
+			},
+		}
+
+	case state.Phase == controlplane.SnapshotRunning:
 		return resumeDecision{
 			From:           offset,
 			ForceBootstrap: true,
 			Reason:         "the previous snapshot was interrupted, so any stored offset is partial",
 		}
+
 	case !offsetFound:
 		return resumeDecision{
 			ForceBootstrap: true,
 			Reason:         "the snapshot is marked complete but no offset was ever committed",
 		}
+
 	default:
 		return resumeDecision{From: offset, Reason: "resuming from the committed offset"}
 	}
@@ -245,10 +269,17 @@ type snapshotHooks struct {
 	log        *slog.Logger
 }
 
-func (h *snapshotHooks) SnapshotStarted(ctx context.Context) error {
-	h.log.Info("snapshot starting", "capture", h.capture)
+func (h *snapshotHooks) SnapshotStarted(ctx context.Context, mode string) error {
+	h.log.Info("snapshot starting", "capture", h.capture, "mode", mode)
 	h.metrics.Set(observability.MetricSnapshotRunning, h.labels, 1)
-	return h.store.BeginSnapshot(ctx, h.pipelineID, h.holder, h.capture)
+	return h.store.BeginSnapshot(ctx, h.pipelineID, h.holder, h.capture, mode)
+}
+
+// SnapshotChunkDone persists how far a chunked snapshot has read, which is what
+// makes it resumable after a crash.
+func (h *snapshotHooks) SnapshotChunkDone(ctx context.Context, table string, key []byte) error {
+	h.log.Debug("snapshot chunk complete", "table", table)
+	return h.store.SaveChunkProgress(ctx, h.pipelineID, h.holder, table, key)
 }
 
 func (h *snapshotHooks) SnapshotCompleted(ctx context.Context, position string) error {
@@ -274,35 +305,39 @@ func captureID(cfg config.Source) string {
 
 // runPipeline reads from the source into the router until ctx ends.
 func (r *Runner) runPipeline(ctx context.Context) error {
-	reader, err := buildReader(r.cfg.Pipeline.Source, r.log)
+	reader, err := buildReader(r.pipeline.Source, r.log)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = reader.Close() }()
 
-	sinks, err := buildSinks(ctx, r.cfg.Pipeline.Sinks)
+	sinks, err := buildSinks(ctx, r.pipeline.Sinks, r.log)
 	if err != nil {
 		return err
 	}
 	defer closeSinks(sinks, r.log)
 
-	offset, offsetFound, err := r.store.LoadOffset(ctx, r.cfg.Pipeline.ID)
+	offset, offsetFound, err := r.store.LoadOffset(ctx, r.pipeline.ID)
 	if err != nil {
 		return err
 	}
-	phase, phaseFound, err := r.store.SnapshotPhase(ctx, r.cfg.Pipeline.ID)
+	state, stateFound, err := r.store.LoadSnapshotState(ctx, r.pipeline.ID)
 	if err != nil {
 		return err
 	}
 
-	plan := planResume(offset, offsetFound, phase, phaseFound)
-	if plan.ForceBootstrap {
+	plan := planResume(offset, offsetFound, state, stateFound)
+	switch {
+	case plan.ForceBootstrap:
 		r.log.Warn("bootstrapping from scratch", "reason", plan.Reason, "stored_offset", offset)
-	} else {
+	case plan.ResumeSnapshot != nil:
+		r.log.Info("resuming", "position", plan.From, "reason", plan.Reason,
+			"snapshot_table", plan.ResumeSnapshot.Table)
+	default:
 		r.log.Info("resuming", "position", plan.From)
 	}
 
-	if cursors, cerr := r.store.LoadSinkCursors(ctx, r.cfg.Pipeline.ID); cerr == nil {
+	if cursors, cerr := r.store.LoadSinkCursors(ctx, r.pipeline.ID); cerr == nil {
 		for _, c := range cursors {
 			r.log.Info("previous sink progress", "sink", c.Sink, "position", c.Position)
 		}
@@ -319,12 +354,12 @@ func (r *Runner) runPipeline(ctx context.Context) error {
 	}
 
 	router := NewRouter(RouterOptions{
-		PipelineID: r.cfg.Pipeline.ID,
-		Holder:     r.cfg.InstanceID,
+		PipelineID: r.pipeline.ID,
+		Holder:     r.instanceID,
 		Store:      r.store,
-		SinkConfig: r.cfg.Pipeline.Sinks,
+		SinkConfig: r.pipeline.Sinks,
 		Sinks:      sinks,
-		Interval:   r.cfg.Pipeline.CommitInterval.D(),
+		Interval:   r.pipeline.CommitInterval.D(),
 		Acker:      acker,
 		Lag:        lag,
 		Metrics:    r.metrics,
@@ -334,13 +369,14 @@ func (r *Runner) runPipeline(ctx context.Context) error {
 	req := source.ReadRequest{
 		From:           plan.From,
 		ForceBootstrap: plan.ForceBootstrap,
+		ResumeSnapshot: plan.ResumeSnapshot,
 		Hooks: &snapshotHooks{
 			store:      r.store,
-			pipelineID: r.cfg.Pipeline.ID,
-			holder:     r.cfg.InstanceID,
-			capture:    captureID(r.cfg.Pipeline.Source),
+			pipelineID: r.pipeline.ID,
+			holder:     r.instanceID,
+			capture:    captureID(r.pipeline.Source),
 			metrics:    r.metrics,
-			labels:     []string{"pipeline", r.cfg.Pipeline.ID},
+			labels:     []string{"pipeline", r.pipeline.ID},
 			log:        r.log,
 		},
 	}
@@ -349,8 +385,8 @@ func (r *Runner) runPipeline(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		defer close(events)
-		defer r.health.Streaming.Store(false)
-		r.health.Streaming.Store(true)
+		defer r.health.SetStreaming(r.pipeline.ID, false)
+		r.health.SetStreaming(r.pipeline.ID, true)
 		rerr := reader.ReadChanges(gctx, req, events)
 		if rerr != nil && !errors.Is(rerr, context.Canceled) {
 			return rerr

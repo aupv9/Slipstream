@@ -19,6 +19,7 @@ import (
 
 	"github.com/aupv9/slipstream/internal/cdc"
 	"github.com/aupv9/slipstream/internal/config"
+	"github.com/aupv9/slipstream/internal/controlplane"
 	"github.com/aupv9/slipstream/internal/source"
 )
 
@@ -102,7 +103,7 @@ func (r *Reader) ReadChanges(ctx context.Context, req source.ReadRequest, out ch
 // before the recorded time, which is a gap nothing can repair.
 func (r *Reader) bootstrap(ctx context.Context, req source.ReadRequest, out chan<- cdc.ChangeEvent) (position, error) {
 	if req.Hooks != nil {
-		if err := req.Hooks.SnapshotStarted(ctx); err != nil {
+		if err := req.Hooks.SnapshotStarted(ctx, controlplane.SnapshotSingle); err != nil {
 			return position{}, fmt.Errorf("mongodb: record snapshot start: %w", err)
 		}
 	}

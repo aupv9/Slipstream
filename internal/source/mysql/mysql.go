@@ -20,6 +20,7 @@ import (
 
 	"github.com/aupv9/slipstream/internal/cdc"
 	"github.com/aupv9/slipstream/internal/config"
+	"github.com/aupv9/slipstream/internal/controlplane"
 	"github.com/aupv9/slipstream/internal/source"
 )
 
@@ -141,7 +142,7 @@ func (r *Reader) checkServerSettings(ctx context.Context, db *sql.DB) error {
 // from choosing the safe side of the race, not from locking the whole server.
 func (r *Reader) bootstrap(ctx context.Context, db *sql.DB, req source.ReadRequest, out chan<- cdc.ChangeEvent) (string, error) {
 	if req.Hooks != nil {
-		if err := req.Hooks.SnapshotStarted(ctx); err != nil {
+		if err := req.Hooks.SnapshotStarted(ctx, controlplane.SnapshotSingle); err != nil {
 			return "", fmt.Errorf("mysql: record snapshot start: %w", err)
 		}
 	}

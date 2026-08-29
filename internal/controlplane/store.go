@@ -192,6 +192,16 @@ func (s *Store) AdvanceSinkCursor(ctx context.Context, pipelineID, holder, sink,
 	return nil
 }
 
+// Snapshot modes.
+const (
+	// SnapshotSingle reads every table inside one consistent transaction. It
+	// is simple and exact, but an interrupted one cannot be resumed.
+	SnapshotSingle = "single"
+	// SnapshotChunked reads tables in key ranges interleaved with the stream,
+	// so progress survives a crash and no long transaction is held open.
+	SnapshotChunked = "chunked"
+)
+
 // Snapshot phases.
 const (
 	// SnapshotRunning means an initial snapshot started but has not finished.
@@ -203,21 +213,51 @@ const (
 
 // BeginSnapshot records that an initial snapshot is starting. Any previous
 // state for the pipeline is overwritten, because a new bootstrap supersedes it.
-func (s *Store) BeginSnapshot(ctx context.Context, pipelineID, holder, slot string) error {
+func (s *Store) BeginSnapshot(ctx context.Context, pipelineID, holder, slot, mode string) error {
+	if mode == "" {
+		mode = SnapshotSingle
+	}
 	tag, err := s.pool.Exec(ctx,
-		`INSERT INTO snapshot_state (pipeline_id, phase, slot_name, started_at, completed_at, consistent_lsn)
-		 SELECT $1, 'running', $3, now(), NULL, ''
+		`INSERT INTO snapshot_state (pipeline_id, phase, slot_name, mode, started_at, completed_at, consistent_lsn, chunk_table, chunk_key)
+		 SELECT $1, 'running', $3, $4, now(), NULL, '', '', NULL
 		   FROM leases
 		  WHERE pipeline_id = $1 AND holder = $2 AND expires_at > now()
 		 ON CONFLICT (pipeline_id) DO UPDATE
 		    SET phase = 'running',
 		        slot_name = excluded.slot_name,
+		        mode = excluded.mode,
 		        started_at = now(),
 		        completed_at = NULL,
-		        consistent_lsn = ''`,
-		pipelineID, holder, slot)
+		        consistent_lsn = '',
+		        chunk_table = '',
+		        chunk_key = NULL`,
+		pipelineID, holder, slot, mode)
 	if err != nil {
 		return fmt.Errorf("controlplane: begin snapshot: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// SaveChunkProgress records how far a chunked snapshot has read. This is what
+// lets an interrupted chunked snapshot pick up where it left off instead of
+// starting over.
+func (s *Store) SaveChunkProgress(ctx context.Context, pipelineID, holder, table string, key []byte) error {
+	var keyArg any
+	if len(key) > 0 {
+		keyArg = string(key)
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE snapshot_state
+		    SET chunk_table = $3, chunk_key = $4::jsonb
+		  WHERE pipeline_id = $1
+		    AND EXISTS (SELECT 1 FROM leases
+		                 WHERE pipeline_id = $1 AND holder = $2 AND expires_at > now())`,
+		pipelineID, holder, table, keyArg)
+	if err != nil {
+		return fmt.Errorf("controlplane: save chunk progress: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrLeaseLost
@@ -244,18 +284,35 @@ func (s *Store) CompleteSnapshot(ctx context.Context, pipelineID, holder, consis
 	return nil
 }
 
-// SnapshotPhase reports the recorded phase. found is false when no snapshot has
-// ever been recorded for the pipeline.
-func (s *Store) SnapshotPhase(ctx context.Context, pipelineID string) (phase string, found bool, err error) {
-	err = s.pool.QueryRow(ctx,
-		`SELECT phase FROM snapshot_state WHERE pipeline_id = $1`, pipelineID).Scan(&phase)
+// SnapshotState is what the control plane knows about a pipeline's snapshot.
+type SnapshotState struct {
+	Phase      string
+	Mode       string
+	ChunkTable string
+	ChunkKey   []byte
+}
+
+// LoadSnapshotState reports the recorded snapshot state. found is false when no
+// snapshot has ever been recorded for the pipeline.
+func (s *Store) LoadSnapshotState(ctx context.Context, pipelineID string) (SnapshotState, bool, error) {
+	var (
+		st  SnapshotState
+		key *string
+	)
+	err := s.pool.QueryRow(ctx,
+		`SELECT phase, mode, chunk_table, chunk_key::text
+		   FROM snapshot_state WHERE pipeline_id = $1`, pipelineID).
+		Scan(&st.Phase, &st.Mode, &st.ChunkTable, &key)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
+		return SnapshotState{}, false, nil
 	}
 	if err != nil {
-		return "", false, fmt.Errorf("controlplane: read snapshot state: %w", err)
+		return SnapshotState{}, false, fmt.Errorf("controlplane: read snapshot state: %w", err)
 	}
-	return phase, true, nil
+	if key != nil {
+		st.ChunkKey = []byte(*key)
+	}
+	return st, true, nil
 }
 
 // DeadLetter parks an event a sink kept rejecting. The pipeline advances past

@@ -6,10 +6,15 @@ import (
 
 	"github.com/aupv9/slipstream/internal/cdc"
 	"github.com/aupv9/slipstream/internal/config"
+	"github.com/aupv9/slipstream/internal/encoding"
 )
 
 func newTestSink(cfg config.KafkaSink) *Sink {
-	return &Sink{name: "events", cfg: cfg}
+	enc, err := encoding.New(encoding.FormatJSON)
+	if err != nil {
+		panic(err)
+	}
+	return &Sink{name: "events", cfg: cfg, enc: enc}
 }
 
 func event(op cdc.Op, id int) cdc.ChangeEvent {

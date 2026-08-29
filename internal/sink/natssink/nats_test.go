@@ -11,6 +11,7 @@ import (
 
 	"github.com/aupv9/slipstream/internal/cdc"
 	"github.com/aupv9/slipstream/internal/config"
+	"github.com/aupv9/slipstream/internal/encoding"
 )
 
 // These tests need a NATS server with JetStream enabled:
@@ -78,7 +79,7 @@ func TestPublishesEveryEvent(t *testing.T) {
 	s, err := New("events", config.NATSSink{
 		URL: url, SubjectPrefix: prefix,
 		AckWait: config.Duration(10 * time.Second), MaxPending: 64,
-	})
+	}, encoding.FormatJSON)
 	if err != nil {
 		t.Fatalf("new sink: %v", err)
 	}
@@ -127,7 +128,7 @@ func TestRepublishingTheSameEventsIsDeduplicated(t *testing.T) {
 	s, err := New("events", config.NATSSink{
 		URL: url, SubjectPrefix: prefix,
 		AckWait: config.Duration(10 * time.Second), MaxPending: 64,
-	})
+	}, encoding.FormatJSON)
 	if err != nil {
 		t.Fatalf("new sink: %v", err)
 	}
@@ -161,7 +162,7 @@ func TestWriteFailsWhenNoStreamAcceptsTheSubject(t *testing.T) {
 	s, err := New("events", config.NATSSink{
 		URL: url, SubjectPrefix: "nobody-listens-here",
 		AckWait: config.Duration(3 * time.Second), MaxPending: 8,
-	})
+	}, encoding.FormatJSON)
 	if err != nil {
 		t.Fatalf("new sink: %v", err)
 	}

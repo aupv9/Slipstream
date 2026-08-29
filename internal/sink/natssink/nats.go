@@ -9,7 +9,6 @@ package natssink
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -18,20 +17,26 @@ import (
 
 	"github.com/aupv9/slipstream/internal/cdc"
 	"github.com/aupv9/slipstream/internal/config"
+	"github.com/aupv9/slipstream/internal/encoding"
 )
 
 // Sink publishes one message per change event.
 type Sink struct {
 	name string
 	cfg  config.NATSSink
+	enc  encoding.Encoder
 	conn *nats.Conn
 	js   nats.JetStreamContext
 }
 
 // New connects to NATS.
-func New(name string, cfg config.NATSSink) (*Sink, error) {
+func New(name string, cfg config.NATSSink, format encoding.Format) (*Sink, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("nats sink %q: url is required", name)
+	}
+	enc, err := encoding.New(format)
+	if err != nil {
+		return nil, fmt.Errorf("nats sink %q: %w", name, err)
 	}
 
 	opts := []nats.Option{
@@ -53,7 +58,7 @@ func New(name string, cfg config.NATSSink) (*Sink, error) {
 		return nil, fmt.Errorf("nats sink %q: connect: %w", name, err)
 	}
 
-	s := &Sink{name: name, cfg: cfg, conn: conn}
+	s := &Sink{name: name, cfg: cfg, enc: enc, conn: conn}
 	if !cfg.CoreOnly {
 		js, err := conn.JetStream(nats.PublishAsyncMaxPending(cfg.MaxPending))
 		if err != nil {
@@ -149,15 +154,16 @@ func (s *Sink) writeCore(batch []cdc.ChangeEvent) error {
 }
 
 func (s *Sink) message(ev cdc.ChangeEvent) (*nats.Msg, error) {
-	payload, err := json.Marshal(ev)
+	payload, err := s.enc.Encode(ev)
 	if err != nil {
-		return nil, fmt.Errorf("nats sink %q: marshal %s: %w", s.name, ev.Position, err)
+		return nil, fmt.Errorf("nats sink %q: %w", s.name, err)
 	}
 	msg := nats.NewMsg(Subject(s.cfg.SubjectPrefix, ev))
 	msg.Data = payload
 	msg.Header.Set(nats.MsgIdHdr, ev.IdempotencyKey())
 	msg.Header.Set("Slipstream-Op", string(ev.Op))
 	msg.Header.Set("Slipstream-Source", ev.SourceID)
+	msg.Header.Set("Content-Type", s.enc.ContentType())
 	return msg, nil
 }
 
