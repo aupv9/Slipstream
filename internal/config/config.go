@@ -111,11 +111,19 @@ type Postgres struct {
 
 // MySQL configures the binlog reader (see internal/source/mysql).
 type MySQL struct {
-	DSN       string   `yaml:"dsn"`
-	ServerID  uint32   `yaml:"server_id"`
-	Tables    []string `yaml:"tables"`
-	Snapshot  bool     `yaml:"snapshot"`
-	UseGTID   bool     `yaml:"use_gtid"`
+	// DSN is a go-sql-driver DSN, e.g. user:pass@tcp(host:3306)/db. The
+	// account needs REPLICATION SLAVE and REPLICATION CLIENT.
+	DSN string `yaml:"dsn"`
+	// ServerID must be unique across the whole replication topology: MySQL
+	// disconnects the older client when two register the same id.
+	ServerID uint32 `yaml:"server_id"`
+	// Tables are "database.table" names to capture. Empty captures every base
+	// table in the DSN's database.
+	Tables []string `yaml:"tables"`
+	// Snapshot takes an initial consistent snapshot when there is nothing to
+	// resume from.
+	Snapshot bool `yaml:"snapshot"`
+	// Heartbeat is how often the server should send a keepalive while idle.
 	Heartbeat Duration `yaml:"heartbeat"`
 }
 

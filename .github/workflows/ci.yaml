@@ -65,6 +65,23 @@ jobs:
             docker exec pg createdb -U postgres "$db"
           done
 
+      # MySQL needs ROW binlog and GTID mode, which a service container cannot
+      # be given, so it is started directly like Postgres.
+      - name: start mysql with row binlog and gtids
+        run: |
+          docker run -d --name my -p 3306:3306 \
+            -e MYSQL_ALLOW_EMPTY_PASSWORD=1 \
+            -e MYSQL_DATABASE=app \
+            mysql:8 \
+            --server-id=1 --log-bin=binlog --binlog-format=ROW \
+            --binlog-row-image=FULL --gtid-mode=ON --enforce-gtid-consistency=ON
+          for _ in $(seq 1 90); do
+            docker exec my mysqladmin ping -h 127.0.0.1 --silent 2>/dev/null && break
+            sleep 2
+          done
+          docker exec my mysql -e "CREATE USER IF NOT EXISTS 'slip'@'%' IDENTIFIED BY 'slip';
+                                   GRANT ALL ON *.* TO 'slip'@'%'; FLUSH PRIVILEGES;"
+
       - name: install psql
         run: command -v psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
 
@@ -85,6 +102,7 @@ jobs:
           SLIPSTREAM_TEST_SOURCE_DSN: postgres://postgres@127.0.0.1:5432/app
           SLIPSTREAM_TEST_MIRROR_DSN: postgres://postgres@127.0.0.1:5432/mirror
           SLIPSTREAM_TEST_NATS_URL: nats://127.0.0.1:4222
+          SLIPSTREAM_TEST_MYSQL_DSN: slip:slip@tcp(127.0.0.1:3306)/app
         run: go test ./... -count=1 -race
 
       # The guarantees that only show up across a process boundary: a leader
@@ -103,6 +121,9 @@ jobs:
           MIRROR_DSN: postgres://postgres@127.0.0.1:5432/mirror
         run: scripts/verify-snapshot-crash.sh
 
-      - name: postgres log on failure
+      - name: server logs on failure
         if: failure()
-        run: docker logs pg | tail -50
+        run: |
+          docker logs pg 2>&1 | tail -40
+          docker logs my 2>&1 | tail -40
+          tail -40 /tmp/nats.log || true

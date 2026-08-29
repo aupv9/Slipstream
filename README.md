@@ -4,8 +4,8 @@ Change data capture that stays small and stays correct. One static Go binary,
 one small Postgres for coordination. No Kafka, no Zookeeper or etcd, no JVM,
 no Debezium.
 
-Sources: **PostgreSQL** (implemented), **MySQL** and **MongoDB** (interfaces in
-place, readers pending — see [Status](#status)).
+Sources: **PostgreSQL** and **MySQL** (implemented), **MongoDB** (see
+[Status](#status)).
 Sinks: generic through an in-process Go interface, with a webhook, a
 Postgres/warehouse upsert writer, NATS, Kafka and stdout built in.
 
@@ -93,10 +93,20 @@ that view. Everything committed at or before that LSN is in the snapshot;
 everything after arrives on the stream. No `FLUSH TABLES WITH READ LOCK`, no
 guessing, no overlap window.
 
-For MySQL the equivalent will be reading `@@GLOBAL.gtid_executed` as the first
-statement of a `REPEATABLE READ` transaction and streaming from that GTID set;
-for MongoDB, recording `clusterTime` before the snapshot and opening the change
-stream with `startAtOperationTime`. Both are documented in their packages.
+MySQL takes the same idea to a server with no exportable snapshot. It records
+`@@GLOBAL.gtid_executed` **before** opening `START TRANSACTION WITH CONSISTENT
+SNAPSHOT`, never after. A transaction committing between the two then shows up
+in both the snapshot and the replayed stream — a duplicate, which idempotent
+sinks absorb. The reverse order would produce a gap instead: a transaction
+inside the recorded GTID set but not in the snapshot's view is skipped by the
+stream and never delivered at all. Given a choice between duplicating and
+losing, this design always duplicates, and that is also why it needs no `FLUSH
+TABLES WITH READ LOCK`.
+
+MySQL positions are GTID sets, never file+offset: a file name and byte offset
+mean nothing after a rotation or a failover. Events are stamped with the set as
+it stood *before* their own transaction, so a process that dies mid-transaction
+resumes by replaying that transaction whole instead of skipping its remainder.
 
 **Leader election.** One statement, no coordination service:
 
@@ -205,7 +215,7 @@ is applying the backpressure).
 | TRUNCATE propagation | done, integration-tested |
 | Publication reconcile (refuse silent table drift) | done, integration-tested |
 | Dead-letter queue with per-event isolation | done, unit-tested |
-| MySQL reader (binlog + GTID) | interface in place, reader pending |
+| MySQL reader (binlog + GTID, snapshot, DDL-aware schema cache) | done, integration-tested |
 | MongoDB reader (change stream) | interface in place, reader pending |
 
 Deliberately **not** built: exactly-once/2PC, parallel chunked snapshots for
