@@ -53,6 +53,14 @@ pipeline:
       # Take a consistent initial snapshot when there is no stored offset.
       snapshot: true
 
+    # MySQL: needs binlog_format=ROW, binlog_row_image=FULL and gtid_mode=ON;
+    # the reader refuses to start otherwise rather than emit partial events.
+    # mysql:
+    #   dsn: ${SLIPSTREAM_MYSQL_DSN}      # slip:pass@tcp(host:3306)/app
+    #   server_id: 1001                   # must be unique across the topology
+    #   tables: [app.customers, app.orders]
+    #   snapshot: true
+
   sinks:
     # Sinks progress independently: a slow one never blocks a fast one beyond
     # its own queue, and the pipeline offset follows the slowest.
