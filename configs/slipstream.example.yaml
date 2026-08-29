@@ -9,6 +9,10 @@
 # stable (containers with generated names are fine as-is).
 instance_id: ${SLIPSTREAM_INSTANCE_ID}
 
+# /metrics, /healthz and /readyz. Leave addr empty to serve nothing.
+observability:
+  addr: "127.0.0.1:9090"
+
 control_plane:
   # A small Postgres of its own — not one of the source databases.
   dsn: ${SLIPSTREAM_CONTROL_PLANE_DSN}
@@ -82,6 +86,27 @@ pipeline:
         timeout: 30s
         headers:
           Authorization: Bearer ${SLIPSTREAM_WEBHOOK_TOKEN}
+
+    # NATS with JetStream: publishes are acknowledged, and the event's
+    # idempotency key is sent as Nats-Msg-Id so the server drops replays inside
+    # the stream's duplicate window. core_only: true skips JetStream and gives
+    # up that guarantee.
+    # - name: bus
+    #   type: nats
+    #   nats:
+    #     url: nats://127.0.0.1:4222
+    #     subject_prefix: cdc
+    #     ack_wait: 30s
+
+    # Kafka: keys make each row stick to one partition, so changes to a row stay
+    # ordered. Without keys a whole table shares one partition.
+    # - name: topics
+    #   type: kafka
+    #   kafka:
+    #     brokers: [127.0.0.1:9092]
+    #     topic_prefix: cdc
+    #     keys:
+    #       public.customers: [id]
 
     # Handy while bringing a pipeline up; JSON lines on stdout.
     # - name: debug

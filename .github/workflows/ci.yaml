@@ -68,10 +68,23 @@ jobs:
       - name: install psql
         run: command -v psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
 
+      # A JetStream server, so the NATS sink is tested against real publish
+      # acknowledgements and real server-side deduplication.
+      - name: start nats with jetstream
+        run: |
+          go install github.com/nats-io/nats-server/v2@latest
+          "$(go env GOPATH)/bin/nats-server" -js -p 4222 -sd /tmp/natsdata >/tmp/nats.log 2>&1 &
+          for _ in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/4222) >/dev/null 2>&1 && break
+            sleep 1
+          done
+
       - name: integration tests
         env:
           SLIPSTREAM_TEST_CP_DSN: postgres://postgres@127.0.0.1:5432/slipstream_cp
           SLIPSTREAM_TEST_SOURCE_DSN: postgres://postgres@127.0.0.1:5432/app
+          SLIPSTREAM_TEST_MIRROR_DSN: postgres://postgres@127.0.0.1:5432/mirror
+          SLIPSTREAM_TEST_NATS_URL: nats://127.0.0.1:4222
         run: go test ./... -count=1 -race
 
       # The guarantees that only show up across a process boundary: a leader

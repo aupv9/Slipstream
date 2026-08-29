@@ -7,6 +7,8 @@ import (
 
 	"github.com/aupv9/slipstream/internal/config"
 	"github.com/aupv9/slipstream/internal/sink"
+	"github.com/aupv9/slipstream/internal/sink/kafkasink"
+	"github.com/aupv9/slipstream/internal/sink/natssink"
 	"github.com/aupv9/slipstream/internal/sink/pgupsert"
 	"github.com/aupv9/slipstream/internal/sink/stdout"
 	"github.com/aupv9/slipstream/internal/sink/webhook"
@@ -57,9 +59,21 @@ func buildSinks(ctx context.Context, cfgs []config.SinkConfig) ([]sink.Sink, err
 				return fail(err)
 			}
 			built = append(built, s)
+		case "nats":
+			s, err := natssink.New(c.Name, c.NATS)
+			if err != nil {
+				return fail(err)
+			}
+			built = append(built, s)
+		case "kafka":
+			s, err := kafkasink.New(c.Name, c.Kafka)
+			if err != nil {
+				return fail(err)
+			}
+			built = append(built, s)
 		default:
 			return fail(fmt.Errorf("pipeline: unknown sink type %q for sink %q "+
-				"(want stdout, webhook or pgupsert)", c.Type, c.Name))
+				"(want stdout, webhook, pgupsert, nats or kafka)", c.Type, c.Name))
 		}
 	}
 	return built, nil

@@ -21,9 +21,11 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aupv9/slipstream/internal/config"
 	"github.com/aupv9/slipstream/internal/controlplane"
+	"github.com/aupv9/slipstream/internal/observability"
 	"github.com/aupv9/slipstream/internal/pipeline"
 )
 
@@ -110,6 +112,27 @@ func cmdRun(args []string) error {
 		log.Info("control-plane schema applied")
 	}
 
+	var (
+		metrics *observability.Registry
+		health  = &observability.Health{}
+		obs     *observability.Server
+	)
+	if cfg.Observability.Addr != "" {
+		metrics = observability.NewRegistry()
+		observability.Register(metrics)
+		obs = observability.NewServer(cfg.Observability.Addr, metrics, health, log)
+		if err := obs.Start(); err != nil {
+			return err
+		}
+		defer func() {
+			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = obs.Stop(shutdown)
+			cancel()
+		}()
+	} else {
+		log.Info("metrics and health endpoints are disabled; set observability.addr to enable them")
+	}
+
 	log.Info("starting",
 		"version", version,
 		"pipeline", cfg.Pipeline.ID,
@@ -118,7 +141,7 @@ func cmdRun(args []string) error {
 		"sinks", sinkNames(cfg),
 		"lease_ttl", cfg.ControlPlane.LeaseTTL.D())
 
-	err = pipeline.NewRunner(cfg, store, log).Run(ctx)
+	err = pipeline.NewRunner(cfg, store, metrics, health, log).Run(ctx)
 	log.Info("stopped")
 	return err
 }

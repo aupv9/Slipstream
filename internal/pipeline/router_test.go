@@ -187,8 +187,7 @@ func TestRouterDeliversEveryEventToEverySinkInOrder(t *testing.T) {
 	b := &fakeSink{name: "b"}
 	cfgs := []config.SinkConfig{sinkCfg("a"), sinkCfg("b")}
 
-	r := NewRouter("p1", "inst1", store, cfgs, []sink.Sink{a, b},
-		5*time.Millisecond, nil, testLogger())
+	r := NewRouter(RouterOptions{PipelineID: "p1", Holder: "inst1", Store: store, SinkConfig: cfgs, Sinks: []sink.Sink{a, b}, Interval: 5 * time.Millisecond, Acker: nil, Log: testLogger()})
 
 	in := events(25)
 	if err := feedAndRun(t, r, in); err != nil {
@@ -226,8 +225,7 @@ func TestRouterCommitsSlowestSinkPosition(t *testing.T) {
 	cfgs[1].BatchMaxEvents = 1
 	cfgs[0].BatchMaxEvents = 1
 
-	r := NewRouter("p1", "inst1", store, cfgs, []sink.Sink{fast, slow},
-		5*time.Millisecond, nil, testLogger())
+	r := NewRouter(RouterOptions{PipelineID: "p1", Holder: "inst1", Store: store, SinkConfig: cfgs, Sinks: []sink.Sink{fast, slow}, Interval: 5 * time.Millisecond, Acker: nil, Log: testLogger()})
 
 	in := events(5)
 	ch := make(chan cdc.ChangeEvent, len(in))
@@ -282,8 +280,7 @@ func TestRouterRetriesFailedWritesAndDoesNotAdvancePastThem(t *testing.T) {
 	cfgs := []config.SinkConfig{sinkCfg("flaky")}
 	cfgs[0].BatchMaxEvents = 100
 
-	r := NewRouter("p1", "inst1", store, cfgs, []sink.Sink{flaky},
-		5*time.Millisecond, nil, testLogger())
+	r := NewRouter(RouterOptions{PipelineID: "p1", Holder: "inst1", Store: store, SinkConfig: cfgs, Sinks: []sink.Sink{flaky}, Interval: 5 * time.Millisecond, Acker: nil, Log: testLogger()})
 
 	in := events(4)
 	if err := feedAndRun(t, r, in); err != nil {
@@ -309,8 +306,7 @@ func TestRouterCommitsNothingWhileASinkHasAcceptedNothing(t *testing.T) {
 	stuck := &fakeSink{name: "stuck", gate: make(chan struct{})}
 	cfgs := []config.SinkConfig{sinkCfg("ok"), sinkCfg("stuck")}
 
-	r := NewRouter("p1", "inst1", store, cfgs, []sink.Sink{ok, stuck},
-		2*time.Millisecond, nil, testLogger())
+	r := NewRouter(RouterOptions{PipelineID: "p1", Holder: "inst1", Store: store, SinkConfig: cfgs, Sinks: []sink.Sink{ok, stuck}, Interval: 2 * time.Millisecond, Acker: nil, Log: testLogger()})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
@@ -335,8 +331,9 @@ func TestRouterAcksOnlyCommittedPositions(t *testing.T) {
 	s := &fakeSink{name: "a"}
 	acker := &recordingAcker{}
 
-	r := NewRouter("p1", "inst1", store, []config.SinkConfig{sinkCfg("a")},
-		[]sink.Sink{s}, 5*time.Millisecond, acker, testLogger())
+	r := NewRouter(RouterOptions{PipelineID: "p1", Holder: "inst1", Store: store,
+		SinkConfig: []config.SinkConfig{sinkCfg("a")}, Sinks: []sink.Sink{s},
+		Interval: 5 * time.Millisecond, Acker: acker, Log: testLogger()})
 
 	in := events(3)
 	if err := feedAndRun(t, r, in); err != nil {
@@ -379,8 +376,7 @@ func TestRouterDeadLettersAfterMaxAttempts(t *testing.T) {
 	cfg.OnFailure = config.OnFailureDeadLetter
 	cfg.MaxAttempts = 2
 
-	r := NewRouter("p1", "inst1", store, []config.SinkConfig{cfg}, []sink.Sink{broken},
-		5*time.Millisecond, nil, testLogger())
+	r := NewRouter(RouterOptions{PipelineID: "p1", Holder: "inst1", Store: store, SinkConfig: []config.SinkConfig{cfg}, Sinks: []sink.Sink{broken}, Interval: 5 * time.Millisecond, Acker: nil, Log: testLogger()})
 
 	in := events(3)
 	if err := feedAndRun(t, r, in); err != nil {
@@ -418,8 +414,7 @@ func TestRouterDeadLetterIsolatesOnlyTheBadEvent(t *testing.T) {
 	cfg.OnFailure = config.OnFailureDeadLetter
 	cfg.MaxAttempts = 2
 
-	r := NewRouter("p1", "inst1", store, []config.SinkConfig{cfg}, []sink.Sink{picky},
-		5*time.Millisecond, nil, testLogger())
+	r := NewRouter(RouterOptions{PipelineID: "p1", Holder: "inst1", Store: store, SinkConfig: []config.SinkConfig{cfg}, Sinks: []sink.Sink{picky}, Interval: 5 * time.Millisecond, Acker: nil, Log: testLogger()})
 
 	in := events(5)
 	if err := feedAndRun(t, r, in); err != nil {
@@ -456,8 +451,7 @@ func TestRouterDoesNotAdvanceWhenParkingFails(t *testing.T) {
 	cfg.OnFailure = config.OnFailureDeadLetter
 	cfg.MaxAttempts = 1
 
-	r := NewRouter("p1", "inst1", store, []config.SinkConfig{cfg}, []sink.Sink{broken},
-		5*time.Millisecond, nil, testLogger())
+	r := NewRouter(RouterOptions{PipelineID: "p1", Holder: "inst1", Store: store, SinkConfig: []config.SinkConfig{cfg}, Sinks: []sink.Sink{broken}, Interval: 5 * time.Millisecond, Acker: nil, Log: testLogger()})
 
 	err := feedAndRun(t, r, events(2))
 	if err == nil {

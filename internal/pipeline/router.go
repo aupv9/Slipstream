@@ -14,6 +14,7 @@ import (
 	"github.com/aupv9/slipstream/internal/cdc"
 	"github.com/aupv9/slipstream/internal/config"
 	"github.com/aupv9/slipstream/internal/controlplane"
+	"github.com/aupv9/slipstream/internal/observability"
 	"github.com/aupv9/slipstream/internal/sink"
 	"github.com/aupv9/slipstream/internal/source"
 )
@@ -41,6 +42,8 @@ type Router struct {
 	log        *slog.Logger
 	interval   time.Duration
 	acker      source.Acker
+	lag        source.LagReporter
+	metrics    *observability.Registry
 
 	workers []*worker
 
@@ -49,19 +52,39 @@ type Router struct {
 	lastOffset string
 }
 
+// RouterOptions gathers what a router needs for one run.
+type RouterOptions struct {
+	PipelineID string
+	Holder     string
+	Store      progressStore
+	SinkConfig []config.SinkConfig
+	Sinks      []sink.Sink
+	Interval   time.Duration
+	// Acker, when set, is told the committed position so the source can
+	// release the log behind it.
+	Acker source.Acker
+	// Lag, when set, is sampled for the lag gauge.
+	Lag     source.LagReporter
+	Metrics *observability.Registry
+	Log     *slog.Logger
+}
+
 // NewRouter wires a router for one pipeline run.
-func NewRouter(pipelineID, holder string, store progressStore, cfgs []config.SinkConfig, sinks []sink.Sink, interval time.Duration, acker source.Acker, log *slog.Logger) *Router {
+func NewRouter(opts RouterOptions) *Router {
 	r := &Router{
-		pipelineID: pipelineID,
-		holder:     holder,
-		store:      store,
-		log:        log.With("component", "router"),
-		interval:   interval,
-		acker:      acker,
+		pipelineID: opts.PipelineID,
+		holder:     opts.Holder,
+		store:      opts.Store,
+		log:        opts.Log.With("component", "router"),
+		interval:   opts.Interval,
+		acker:      opts.Acker,
+		lag:        opts.Lag,
+		metrics:    opts.Metrics,
 		positions:  make(map[int64]string),
 	}
-	for i, s := range sinks {
-		r.workers = append(r.workers, newWorker(cfgs[i], s, r.park(s.Name()), log))
+	for i, s := range opts.Sinks {
+		r.workers = append(r.workers, newWorker(opts.SinkConfig[i], s, r.park(s.Name()),
+			opts.PipelineID, opts.Metrics, opts.Log))
 	}
 	return r
 }
@@ -76,8 +99,13 @@ func (r *Router) park(sinkName string) parkFunc {
 			// evidence is worse than losing its shape.
 			payload = []byte(`{"error":"event could not be marshalled"}`)
 		}
-		return r.store.DeadLetter(ctx, r.pipelineID, r.holder, sinkName,
-			ev.Position, attempts, cause.Error(), payload)
+		if err := r.store.DeadLetter(ctx, r.pipelineID, r.holder, sinkName,
+			ev.Position, attempts, cause.Error(), payload); err != nil {
+			return err
+		}
+		r.metrics.Add(observability.MetricDeadLettered,
+			[]string{"pipeline", r.pipelineID, "sink", sinkName}, 1)
+		return nil
 	}
 }
 
@@ -149,6 +177,10 @@ func (r *Router) feed(ctx context.Context, in <-chan cdc.ChangeEvent) error {
 			}
 			seq++
 			r.recordPosition(seq, ev.Position)
+			r.metrics.Add(observability.MetricEventsRead, []string{"pipeline", r.pipelineID}, 1)
+			if ev.Op == cdc.OpRead {
+				r.metrics.Add(observability.MetricSnapshotRows, []string{"pipeline", r.pipelineID}, 1)
+			}
 			for _, w := range r.workers {
 				select {
 				case w.queue <- seqEvent{seq: seq, ev: ev}:
@@ -175,6 +207,7 @@ func (r *Router) commitLoop(ctx context.Context, stop <-chan struct{}) error {
 	for {
 		select {
 		case <-ticker.C:
+			r.sample()
 			if err := r.commitOnce(ctx); err != nil {
 				if errors.Is(err, controlplane.ErrLeaseLost) {
 					r.log.Error("lease lost; stopping pipeline", "err", err)
@@ -189,6 +222,19 @@ func (r *Router) commitLoop(ctx context.Context, stop <-chan struct{}) error {
 			return nil
 		case <-ctx.Done():
 			return nil
+		}
+	}
+}
+
+// sample refreshes the gauges that describe the pipeline right now.
+func (r *Router) sample() {
+	for _, w := range r.workers {
+		r.metrics.Set(observability.MetricQueueDepth,
+			[]string{"pipeline", r.pipelineID, "sink", w.sink.Name()}, int64(len(w.queue)))
+	}
+	if r.lag != nil {
+		if bytes, ok := r.lag.LagBytes(); ok {
+			r.metrics.Set(observability.MetricLagBytes, []string{"pipeline", r.pipelineID}, bytes)
 		}
 	}
 }
@@ -234,6 +280,7 @@ func (r *Router) commitOnce(ctx context.Context) error {
 		if r.acker != nil {
 			r.acker.Ack(minPos)
 		}
+		r.metrics.Add(observability.MetricCommits, []string{"pipeline", r.pipelineID}, 1)
 		r.log.Debug("offset committed", "position", minPos, "seq", minSeq)
 	}
 
@@ -256,11 +303,13 @@ type parkFunc func(ctx context.Context, ev cdc.ChangeEvent, attempts int, cause 
 
 // worker drives one sink.
 type worker struct {
-	cfg   config.SinkConfig
-	sink  sink.Sink
-	queue chan seqEvent
-	park  parkFunc
-	log   *slog.Logger
+	cfg      config.SinkConfig
+	sink     sink.Sink
+	queue    chan seqEvent
+	park     parkFunc
+	pipeline string
+	metrics  *observability.Registry
+	log      *slog.Logger
 
 	mu           sync.Mutex
 	doneSeq      int64
@@ -268,14 +317,21 @@ type worker struct {
 	persistedSeq int64
 }
 
-func newWorker(cfg config.SinkConfig, s sink.Sink, park parkFunc, log *slog.Logger) *worker {
+func newWorker(cfg config.SinkConfig, s sink.Sink, park parkFunc, pipeline string, metrics *observability.Registry, log *slog.Logger) *worker {
 	return &worker{
-		cfg:   cfg,
-		sink:  s,
-		queue: make(chan seqEvent, cfg.QueueSize),
-		park:  park,
-		log:   log.With("sink", s.Name()),
+		cfg:      cfg,
+		sink:     s,
+		queue:    make(chan seqEvent, cfg.QueueSize),
+		park:     park,
+		pipeline: pipeline,
+		metrics:  metrics,
+		log:      log.With("sink", s.Name()),
 	}
+}
+
+// labels are this worker's metric labels.
+func (w *worker) labels() []string {
+	return []string{"pipeline", w.pipeline, "sink", w.sink.Name()}
 }
 
 func (w *worker) progress() (int64, string) {
@@ -368,9 +424,12 @@ func (w *worker) flush(ctx context.Context, batch []cdc.ChangeEvent, lastSeq int
 		err := w.sink.Write(ctx, batch)
 		if err == nil {
 			w.setProgress(lastSeq, lastPos)
+			w.metrics.Add(observability.MetricBatchesWritten, w.labels(), 1)
+			w.metrics.Add(observability.MetricEventsWritten, w.labels(), int64(len(batch)))
 			w.log.Debug("batch written", "events", len(batch), "seq", lastSeq)
 			return nil
 		}
+		w.metrics.Add(observability.MetricWriteFailures, w.labels(), 1)
 		if ctx.Err() != nil {
 			// Shutting down: this batch was never acknowledged, so it will be
 			// replayed after resume.
@@ -417,6 +476,7 @@ func (w *worker) quarantine(ctx context.Context, batch []cdc.ChangeEvent, attemp
 	parked := 0
 	for _, ev := range batch {
 		if err := w.sink.Write(ctx, []cdc.ChangeEvent{ev}); err == nil {
+			w.metrics.Add(observability.MetricEventsWritten, w.labels(), 1)
 			continue
 		} else if ctx.Err() != nil {
 			return nil

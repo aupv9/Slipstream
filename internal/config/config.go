@@ -39,9 +39,17 @@ type Config struct {
 	// InstanceID identifies this process in the leases table. Defaults to
 	// "<hostname>-<pid>", which is distinct enough to make split-brain
 	// visible in the table if it ever happened.
-	InstanceID   string       `yaml:"instance_id"`
-	ControlPlane ControlPlane `yaml:"control_plane"`
-	Pipeline     Pipeline     `yaml:"pipeline"`
+	InstanceID    string        `yaml:"instance_id"`
+	ControlPlane  ControlPlane  `yaml:"control_plane"`
+	Pipeline      Pipeline      `yaml:"pipeline"`
+	Observability Observability `yaml:"observability"`
+}
+
+// Observability configures the metrics and health endpoints.
+type Observability struct {
+	// Addr is the listen address for /metrics, /healthz and /readyz. Empty
+	// disables the endpoints entirely.
+	Addr string `yaml:"addr"`
 }
 
 // ControlPlane points at the small Postgres holding offsets and leases.
@@ -148,6 +156,43 @@ type SinkConfig struct {
 
 	Webhook  WebhookSink  `yaml:"webhook"`
 	PGUpsert PGUpsertSink `yaml:"pgupsert"`
+	NATS     NATSSink     `yaml:"nats"`
+	Kafka    KafkaSink    `yaml:"kafka"`
+}
+
+// NATSSink publishes events to NATS, one message per event.
+type NATSSink struct {
+	URL string `yaml:"url"`
+	// SubjectPrefix is prepended to <schema>.<table>.
+	SubjectPrefix string `yaml:"subject_prefix"`
+	// CoreOnly publishes without JetStream. Core NATS does not acknowledge
+	// publishes, so an event can be lost after Slipstream counted it
+	// delivered; JetStream (the default) both acknowledges and deduplicates on
+	// the message ID.
+	CoreOnly bool `yaml:"core_only"`
+	// MaxPending bounds in-flight async publishes.
+	MaxPending int `yaml:"max_pending"`
+	// AckWait bounds how long a batch waits for its acknowledgements.
+	AckWait Duration `yaml:"ack_wait"`
+	Token   string   `yaml:"token"`
+	// CredentialsFile is a NATS .creds file for authentication.
+	CredentialsFile string `yaml:"credentials_file"`
+}
+
+// KafkaSink publishes events to Kafka.
+type KafkaSink struct {
+	Brokers []string `yaml:"brokers"`
+	// Topic pins every event to one topic. Left empty, the topic is
+	// <topic_prefix>.<schema>.<table>.
+	Topic       string `yaml:"topic"`
+	TopicPrefix string `yaml:"topic_prefix"`
+	// Keys maps "schema.table" to its key columns. With them, the partition
+	// key is the row identity so changes to one row stay ordered; without
+	// them the whole table shares one partition.
+	Keys             map[string][]string `yaml:"keys"`
+	Compression      string              `yaml:"compression"`
+	AutoCreateTopics bool                `yaml:"auto_create_topics"`
+	Timeout          Duration            `yaml:"timeout"`
 }
 
 // Failure policies for a sink that keeps rejecting a batch.
@@ -248,6 +293,15 @@ func (c *Config) applyDefaults() {
 		}
 		if s.Webhook.Timeout == 0 {
 			s.Webhook.Timeout = Duration(30 * time.Second)
+		}
+		if s.NATS.AckWait == 0 {
+			s.NATS.AckWait = Duration(30 * time.Second)
+		}
+		if s.NATS.MaxPending == 0 {
+			s.NATS.MaxPending = 256
+		}
+		if s.Kafka.Timeout == 0 {
+			s.Kafka.Timeout = Duration(30 * time.Second)
 		}
 		if s.PGUpsert.DeletedCol == "" {
 			s.PGUpsert.DeletedCol = "_deleted_at"
