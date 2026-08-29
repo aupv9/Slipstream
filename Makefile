@@ -1,7 +1,7 @@
 BINARY  := bin/slipstream
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-.PHONY: build test test-integration vet fmt clean
+.PHONY: build test test-integration vet fmt proto clean
 
 build:
 	go build -ldflags "-X main.version=$(VERSION)" -o $(BINARY) ./cmd/slipstream
@@ -19,6 +19,13 @@ test-integration:
 
 vet:
 	go vet ./...
+
+# Regenerates internal/encoding/eventpb from the .proto. Needs buf and
+# protoc-gen-go, neither of which is required to build or test:
+#   go install github.com/bufbuild/buf/cmd/buf@latest
+#   go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+proto:
+	buf generate
 
 fmt:
 	gofmt -l -w .
