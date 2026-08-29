@@ -253,7 +253,14 @@ func TestStreamsInsertUpdateDeleteAndDrop(t *testing.T) {
 	if _, err := f.coll().InsertOne(ctx, bson.M{"_id": 2, "note": "inserted"}); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	ins := waitFor(t, events, func(ev cdc.ChangeEvent) bool { return ev.Op == cdc.OpCreate })
+	// The recorded cluster time can sit slightly before the seed write, so the
+	// stream may replay documents the snapshot already delivered. That is the
+	// safe side of the trade-off — duplicates, never gaps — so wait for this
+	// document rather than assuming the next insert is it.
+	ins := waitFor(t, events, func(ev cdc.ChangeEvent) bool {
+		id, ok := docID(ev)
+		return ev.Op == cdc.OpCreate && ok && id == 2
+	})
 	if ins.After["note"] != "inserted" {
 		t.Errorf("insert = %v", ins.After)
 	}
@@ -311,8 +318,16 @@ func TestResumeFromStoredToken(t *testing.T) {
 	if _, err := f.coll().InsertOne(ctx, bson.M{"_id": 2, "note": "streamed"}); err != nil {
 		t.Fatalf("insert 2: %v", err)
 	}
-	streamed := waitFor(t, events, func(ev cdc.ChangeEvent) bool { return ev.Op == cdc.OpCreate })
+	// Take the token of this specific insert; a replayed earlier document would
+	// make the assertion below meaningless.
+	streamed := waitFor(t, events, func(ev cdc.ChangeEvent) bool {
+		id, ok := docID(ev)
+		return ev.Op == cdc.OpCreate && ok && id == 2
+	})
 	resumeFrom := streamed.Position
+	if resumeFrom == "" {
+		t.Fatal("streamed event carries no resume token")
+	}
 
 	stop()
 	for range events {

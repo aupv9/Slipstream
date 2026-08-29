@@ -132,27 +132,39 @@ func (r *Reader) bootstrap(ctx context.Context, req source.ReadRequest, out chan
 }
 
 // operationTime asks the server for the cluster time the stream can start from.
+//
+// Both timestamps the server offers are consulted and the later one wins.
+// operationTime can lag behind on a command that read nothing, and starting
+// earlier than necessary means replaying changes the snapshot already covers —
+// harmless, since sinks are idempotent, but wasteful. Starting *later* than the
+// snapshot's view would be the unfixable direction, which is why this only ever
+// moves the start point forward to a time the server has already reported.
 func (r *Reader) operationTime(ctx context.Context) (bson.Timestamp, error) {
 	var raw bson.Raw
-	err := r.client.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&raw)
+	err := r.client.Database(r.cfg.Database).RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&raw)
 	if err != nil {
 		return bson.Timestamp{}, fmt.Errorf("mongodb: hello: %w", err)
 	}
 
-	if v, lookupErr := raw.LookupErr("operationTime"); lookupErr == nil {
-		if t, i, ok := v.TimestampOK(); ok {
-			return bson.Timestamp{T: t, I: i}, nil
+	var best bson.Timestamp
+	for _, path := range [][]string{{"operationTime"}, {"$clusterTime", "clusterTime"}} {
+		v, lookupErr := raw.LookupErr(path...)
+		if lookupErr != nil {
+			continue
+		}
+		t, i, ok := v.TimestampOK()
+		if !ok {
+			continue
+		}
+		if t > best.T || (t == best.T && i > best.I) {
+			best = bson.Timestamp{T: t, I: i}
 		}
 	}
-	// Fall back to the gossiped cluster time on deployments that do not report
-	// operationTime for this command.
-	if v, lookupErr := raw.LookupErr("$clusterTime", "clusterTime"); lookupErr == nil {
-		if t, i, ok := v.TimestampOK(); ok {
-			return bson.Timestamp{T: t, I: i}, nil
-		}
+	if best.T == 0 {
+		return bson.Timestamp{}, fmt.Errorf("mongodb: server reported no cluster time; " +
+			"change streams need a replica set or sharded cluster")
 	}
-	return bson.Timestamp{}, fmt.Errorf("mongodb: server reported no operationTime; " +
-		"change streams need a replica set or sharded cluster")
+	return best, nil
 }
 
 // snapshot reads the configured collections.
