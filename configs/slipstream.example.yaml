@@ -61,6 +61,13 @@ pipeline:
     #   tables: [app.customers, app.orders]
     #   snapshot: true
 
+    # MongoDB: needs a replica set or sharded cluster for change streams.
+    # mongodb:
+    #   uri: ${SLIPSTREAM_MONGO_URI}      # mongodb://host:27017/?replicaSet=rs0
+    #   database: app
+    #   collections: [customers, orders]
+    #   snapshot: true
+
   sinks:
     # Sinks progress independently: a slow one never blocks a fast one beyond
     # its own queue, and the pipeline offset follows the slowest.

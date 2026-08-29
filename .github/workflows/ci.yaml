@@ -82,6 +82,21 @@ jobs:
           docker exec my mysql -e "CREATE USER IF NOT EXISTS 'slip'@'%' IDENTIFIED BY 'slip';
                                    GRANT ALL ON *.* TO 'slip'@'%'; FLUSH PRIVILEGES;"
 
+      # Change streams need a replica set; a standalone mongod has none.
+      - name: start mongodb as a replica set
+        run: |
+          docker run -d --name mongo -p 27017:27017 mongo:7 \
+            --replSet rs0 --bind_ip_all
+          for _ in $(seq 1 60); do
+            docker exec mongo mongosh --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker exec mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]})'
+          for _ in $(seq 1 60); do
+            docker exec mongo mongosh --quiet --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true && break
+            sleep 2
+          done
+
       - name: install psql
         run: command -v psql || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
 
@@ -103,6 +118,7 @@ jobs:
           SLIPSTREAM_TEST_MIRROR_DSN: postgres://postgres@127.0.0.1:5432/mirror
           SLIPSTREAM_TEST_NATS_URL: nats://127.0.0.1:4222
           SLIPSTREAM_TEST_MYSQL_DSN: slip:slip@tcp(127.0.0.1:3306)/app
+          SLIPSTREAM_TEST_MONGO_URI: mongodb://127.0.0.1:27017/?replicaSet=rs0
         run: go test ./... -count=1 -race
 
       # The guarantees that only show up across a process boundary: a leader
@@ -126,4 +142,5 @@ jobs:
         run: |
           docker logs pg 2>&1 | tail -40
           docker logs my 2>&1 | tail -40
+          docker logs mongo 2>&1 | tail -40
           tail -40 /tmp/nats.log || true

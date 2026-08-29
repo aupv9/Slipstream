@@ -129,11 +129,19 @@ type MySQL struct {
 
 // MongoDB configures the change-stream reader (see internal/source/mongo).
 type MongoDB struct {
-	URI          string   `yaml:"uri"`
-	Database     string   `yaml:"database"`
-	Collections  []string `yaml:"collections"`
-	Snapshot     bool     `yaml:"snapshot"`
-	FullDocument string   `yaml:"full_document"`
+	// URI must reach a replica set or sharded cluster; a standalone mongod has
+	// no change streams.
+	URI      string `yaml:"uri"`
+	Database string `yaml:"database"`
+	// Collections to capture. Empty captures every collection in the database.
+	Collections []string `yaml:"collections"`
+	// Snapshot reads the collections before streaming when there is nothing to
+	// resume from.
+	Snapshot bool `yaml:"snapshot"`
+	// FullDocument controls what an update carries; the default, updateLookup,
+	// fetches the whole document so a sink can upsert it. "default" sends only
+	// the changed fields.
+	FullDocument string `yaml:"full_document"`
 }
 
 // SinkConfig configures one sink. Name must be unique inside the pipeline: it

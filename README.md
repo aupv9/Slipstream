@@ -4,8 +4,7 @@ Change data capture that stays small and stays correct. One static Go binary,
 one small Postgres for coordination. No Kafka, no Zookeeper or etcd, no JVM,
 no Debezium.
 
-Sources: **PostgreSQL** and **MySQL** (implemented), **MongoDB** (see
-[Status](#status)).
+Sources: **PostgreSQL**, **MySQL** and **MongoDB**.
 Sinks: generic through an in-process Go interface, with a webhook, a
 Postgres/warehouse upsert writer, NATS, Kafka and stdout built in.
 
@@ -102,6 +101,12 @@ inside the recorded GTID set but not in the snapshot's view is skipped by the
 stream and never delivered at all. Given a choice between duplicating and
 losing, this design always duplicates, and that is also why it needs no `FLUSH
 TABLES WITH READ LOCK`.
+
+MongoDB does the same thing again: record the cluster time from the server,
+snapshot the collections, then open the change stream at exactly that time with
+`startAtOperationTime`. After the first event the driver's own resume token
+takes over as the position, since that is the resume unit MongoDB itself
+guarantees.
 
 MySQL positions are GTID sets, never file+offset: a file name and byte offset
 mean nothing after a rotation or a failover. Events are stamped with the set as
@@ -216,7 +221,7 @@ is applying the backpressure).
 | Publication reconcile (refuse silent table drift) | done, integration-tested |
 | Dead-letter queue with per-event isolation | done, unit-tested |
 | MySQL reader (binlog + GTID, snapshot, DDL-aware schema cache) | done, integration-tested |
-| MongoDB reader (change stream) | interface in place, reader pending |
+| MongoDB reader (change stream, snapshot, resume tokens) | done; mapping unit-tested locally, server tests run in CI |
 
 Deliberately **not** built: exactly-once/2PC, parallel chunked snapshots for
 very large tables (a single-transaction snapshot is enough well past most
